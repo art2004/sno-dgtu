@@ -326,7 +326,13 @@ def _migrate_schema(eng: Engine) -> None:
             if col not in existing[table]:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
 
-    # 3) One-time (idempotent) cleanup: events left with 0 participations by older versions.
+    # 3) Annual report: indicator catalog, achievements; legacy participations are copied
+    #    into achievements (idempotent, nothing deleted) — see achievements.py.
+    import achievements
+
+    achievements.ensure_schema(eng)
+
+    # 4) One-time (idempotent) cleanup: events left with 0 participations by older versions.
     delete_orphan_events(db_path=eng)
 
 
@@ -849,10 +855,11 @@ def delete_participation(
 
 
 def _delete_orphans(conn, event_ids: Optional[list[int]] = None) -> int:  # noqa: ANN001
-    """Delete events without participations (all, or only among event_ids).
+    """Delete events without participations and achievements (all, or only among event_ids).
     Linked meetings stay in the report: their event_id is cleared first (same as the
     FK's ON DELETE SET NULL, done explicitly so it never depends on FK support)."""
-    cond = "NOT EXISTS (SELECT 1 FROM participations p WHERE p.event_id = events.id)"
+    cond = ("NOT EXISTS (SELECT 1 FROM participations p WHERE p.event_id = events.id) "
+            "AND NOT EXISTS (SELECT 1 FROM achievements a WHERE a.event_id = events.id)")
     params: dict[str, Any] = {}
     if event_ids is not None:
         if not event_ids:
@@ -1178,6 +1185,12 @@ def available_years(db_path: DbTarget = None) -> list[int]:
                 years.add(_to_date(d).year)
             except (TypeError, ValueError):
                 pass
+    try:
+        import achievements
+
+        years.update(achievements.available_years(db_path))
+    except Exception:  # noqa: BLE001 — table may not exist yet in very old DBs
+        pass
     return sorted(years, reverse=True)
 
 
@@ -1336,23 +1349,28 @@ EVENT_TYPE_TO_KIND = {"конференция": "Конференция"}
 
 
 def unlinked_member_events(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
-    """Member events (deduplicated by the events table) with ≥1 participation in the year
+    """Member events (deduplicated by the events table) with ≥1 achievement in the year
     that are not linked to any meeting yet. Suggested kind/topic/format included."""
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
         rows = _rows(conn.execute(text(
             f"""
-            SELECT e.id AS event_id, e.title, e.type, e.event_date,
-                   COUNT(p.id) AS participants_count
+            SELECT e.id AS event_id, e.title, e.type, e.event_date
             FROM events e
-            JOIN participations p ON p.event_id = e.id
-            WHERE NOT EXISTS (SELECT 1 FROM meetings m WHERE m.event_id = e.id) {cond}
-            GROUP BY e.id, e.title, e.type, e.event_date
+            WHERE (EXISTS (SELECT 1 FROM achievements a WHERE a.event_id = e.id)
+                   OR EXISTS (SELECT 1 FROM participations p WHERE p.event_id = e.id))
+              AND NOT EXISTS (SELECT 1 FROM meetings m WHERE m.event_id = e.id) {cond}
             ORDER BY e.event_date, LOWER(e.title)
             """
         ), params))
+        people: dict[int, set] = {}
+        for eid, uid in conn.execute(text(
+            "SELECT event_id, owner_id FROM achievements WHERE event_id IS NOT NULL AND owner_id IS NOT NULL "
+            "UNION SELECT event_id, user_id FROM participations"
+        )):
+            people.setdefault(int(eid), set()).add(int(uid))
     for r in rows:
-        r["participants_count"] = int(r["participants_count"] or 0)
+        r["participants_count"] = len(people.get(int(r["event_id"]), ()))
         r["suggested_kind"] = EVENT_TYPE_TO_KIND.get(r["type"], "Другое")
         r["suggested_topic"] = f"Выступление членов СНО в рамках «{r['title']}»"
         r["suggested_formats"] = ["Выступления с докладами"] if r["type"] == "конференция" else []

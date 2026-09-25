@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +14,8 @@ import brand
 import db
 import report
 import ru_text
+import achievements as ach
+import ui_achievements as ua
 
 st.set_page_config(
     page_title=brand.PAGE_TITLE,
@@ -175,90 +177,6 @@ def render_sidebar(user: dict) -> None:
 # ── Member views ────────────────────────────────────────────────────────────
 
 
-TYPE_LABELS = {
-    "грант": "грант",
-    "конференция": "конференция",
-    "конкурс": "конкурс",
-    "стипендия": "стипендия",
-    "статья": "статья",
-}
-_P_FIELDS = {"title": "", "topic": "", "ach": ""}
-
-
-def _add_participation_cb(user_id: int | None, pfx: str = "p_") -> None:
-    """on_click callback: runs before the rerun, so it may reset the input widgets.
-    user_id None → admin form: the member is taken from the «<pfx>user» selectbox."""
-    ss = st.session_state
-    on_behalf = user_id is None
-    if on_behalf:
-        user_id = ss.get(f"{pfx}user")
-        if not user_id:
-            ss[f"{pfx}msg"] = ("error", "Выберите участника.")
-            return
-    etype = ss.get(f"{pfx}type", db.EVENT_TYPES[0])
-    title = (ss.get(f"{pfx}title") or "").strip()
-    is_article = etype == db.ARTICLE_TYPE
-    if not title:
-        ss[f"{pfx}msg"] = ("error", "Укажите название статьи." if is_article else "Укажите название мероприятия.")
-        return
-    try:
-        res = db.add_participation_ex(
-            user_id,
-            title,
-            etype,
-            ss.get(f"{pfx}date") or date.today(),
-            article_topic=ss.get(f"{pfx}topic") if is_article else None,
-            indexing=ss.get(f"{pfx}indexing") if is_article else None,
-            achievement_number=ss.get(f"{pfx}ach"),
-        )
-    except db.DuplicateError:
-        ss[f"{pfx}msg"] = ("warning", ("Участник уже зарегистрирован" if on_behalf else "Вы уже зарегистрированы")
-                           + " на это мероприятие (одинаковые название, тип и дата).")
-        return
-    except ValueError as e:
-        ss[f"{pfx}msg"] = ("error", str(e))
-        return
-    msgs = [("success", "Статья добавлена." if is_article else "Участие добавлено.")]
-    if res["indexing_conflict"]:
-        msgs.append(("info", f"Эта статья уже добавлена соавтором с индексацией "
-                             f"«{res['indexing_conflict']}» — оставлена она."))
-    ss[f"{pfx}msg"] = msgs
-    ss.update({f"{pfx}{k}": v for k, v in _P_FIELDS.items()})
-
-
-def _participation_form(user_id: int | None, pfx: str = "p_") -> None:
-    """Add-participation inputs (no st.form: article fields appear as soon as «статья»
-    is chosen). Used by members (pfx p_) and by admins on behalf of a member (ap_)."""
-    for k, v in _P_FIELDS.items():
-        st.session_state.setdefault(f"{pfx}{k}", v)
-    st.session_state.setdefault(f"{pfx}date", date.today())
-    col1, col2 = st.columns(2)
-    with col1:
-        event_type = st.selectbox(
-            "Тип мероприятия", db.EVENT_TYPES, key=f"{pfx}type",
-            format_func=lambda t: TYPE_LABELS.get(t, t),
-        )
-        st.date_input("Дата", key=f"{pfx}date", format="DD.MM.YYYY")
-    is_article = event_type == db.ARTICLE_TYPE
-    with col2:
-        st.text_input(
-            "Название статьи" if is_article else "Название",
-            key=f"{pfx}title",
-            placeholder="Название статьи" if is_article else "Например: УМНИК 2026",
-        )
-        if is_article:
-            st.text_input("Тема статьи", key=f"{pfx}topic")
-            st.selectbox("Индексация", db.INDEXING_OPTIONS, key=f"{pfx}indexing")
-    st.text_input(
-        "Номер достижения (с сайта вуза, необязательно)",
-        key=f"{pfx}ach",
-        max_chars=db.ACHIEVEMENT_MAX_LEN,
-    )
-    st.button("Сохранить", type="primary", key=f"{pfx}save",
-              on_click=_add_participation_cb, args=(user_id, pfx))
-    _show_msgs(f"{pfx}msg")
-
-
 def _show_msgs(key: str) -> None:
     msgs = st.session_state.pop(key, None)
     if not msgs:
@@ -270,123 +188,21 @@ def _show_msgs(key: str) -> None:
 
 
 def member_cabinet(user: dict) -> None:
-    st.title("Мои мероприятия")
-    st.caption("Добавляйте участия в гранты, конференции, конкурсы, стипендии и статьи.")
+    st.title("Мои достижения")
+    st.caption("Доклады, публикации, конкурсы, гранты, стипендии и другие достижения — "
+               "из них собирается годовой отчёт СНО.")
 
     this_year = date.today().year
-    summary = db.user_year_summary(user["id"], this_year)
-    (st.success if summary["total"] else st.info)(
-        ru_text.member_year_summary(this_year, summary)
-    )
+    has, summary = ua.year_summary_text(user, this_year)
+    (st.success if has else st.info)(summary)
 
-    tab_mine, tab_stats = st.tabs(["Мои участия", "Статистика СНО"])
+    tab_mine, tab_stats = st.tabs(["Мои достижения", "Статистика СНО"])
     with tab_stats:
-        member_stats()
+        ua.member_stats(_year_choices(include_all=True), _year_label)
     with tab_mine:
-        _member_participations(user)
-
-
-def _member_participations(user: dict) -> None:
-    with st.expander("➕ Добавить участие", expanded=True):
-        _participation_form(user["id"], "p_")
-
-    rows = db.list_participations_for_user(user["id"])
-    st.subheader(f"Список ({len(rows)})")
-    _show_msgs("ach_msg")
-    if not rows:
-        st.info("Пока нет участий. Добавьте первое выше.")
-        return
-
-    for r in rows:
-        pid = r["participation_id"]
-        c1, c2, c3, c4, c5, c6 = st.columns([4, 2, 2, 2, 1, 1])
-        c1.write(r["title"])
-        if r["type"] == db.ARTICLE_TYPE and (r.get("article_topic") or r.get("indexing")):
-            c1.caption(" · ".join(x for x in (r.get("article_topic"), r.get("indexing")) if x))
-        c2.write(r["type"])
-        c3.write(r["event_date"])
-        ach = r.get("achievement_number")
-        c4.caption(f"№ достижения: {ach}" if ach else "без номера достижения")
-        with c5:
-            with st.popover("✏️", help="Номер достижения"):
-                new_ach = st.text_input(
-                    "Номер достижения (с сайта вуза)",
-                    value=ach or "",
-                    key=f"ach_{pid}",
-                    max_chars=db.ACHIEVEMENT_MAX_LEN,
-                )
-                if st.button("Сохранить номер", key=f"ach_save_{pid}"):
-                    try:
-                        db.set_achievement_number(pid, new_ach, user_id=user["id"])
-                        st.session_state["ach_msg"] = ("success", "Номер достижения сохранён.")
-                        st.rerun()
-                    except ValueError as e:
-                        st.error(str(e))
-        with c6:
-            if st.button("🗑", key=f"del_p_{pid}", help="Удалить"):
-                st.session_state[f"confirm_del_p_{pid}"] = True
-
-        confirm_key = f"confirm_del_p_{pid}"
-        if st.session_state.get(confirm_key):
-            st.warning(f"Удалить участие в «{r['title']}»?")
-            b1, b2, _ = st.columns([1, 1, 4])
-            if b1.button("Да, удалить", key=f"yes_p_{pid}", type="primary"):
-                db.delete_participation(pid, user_id=user["id"])
-                st.session_state.pop(confirm_key, None)
-                st.rerun()
-            if b2.button("Отмена", key=f"no_p_{pid}"):
-                st.session_state.pop(confirm_key, None)
-                st.rerun()
-
-
-def member_stats() -> None:
-    """СНО-wide statistics for members: events only — no names, logins or numbers."""
-    st.subheader("Статистика СНО")
-    choices = _year_choices(include_all=True)
-    year = st.selectbox("Период", choices, index=choices.index(date.today().year),
-                        format_func=_year_label, key="m_stats_year")
-    y = year or None
-    by_event = db.stats_by_event(y)
-    c1, c2 = st.columns(2)
-    c1.metric("Мероприятий", len(by_event))
-    c2.metric("Участий", sum(r["participants_count"] for r in by_event))
-    if not by_event:
-        st.info("За выбранный период мероприятий пока нет.")
-        return
-
-    counts = {t: {"events": 0, "parts": 0} for t in db.EVENT_TYPES}
-    for r in by_event:
-        if r["type"] in counts:
-            counts[r["type"]]["events"] += 1
-            counts[r["type"]]["parts"] += r["participants_count"]
-    df_type = pd.DataFrame(
-        [{"Тип": t, "Мероприятий": c["events"], "Участий": c["parts"]} for t, c in counts.items()]
-    )
-    st.markdown("#### По типам мероприятий")
-    g1, g2 = st.columns([3, 2])
-    with g1:
-        fig = px.bar(df_type, x="Тип", y="Мероприятий", text="Мероприятий")
-        fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), xaxis_title=None,
-                          yaxis_title=None, yaxis=dict(fixedrange=True, rangemode="tozero"),
-                          xaxis=dict(fixedrange=True))
-        fig.update_traces(textposition="outside", hovertemplate="%{x}: %{y}<extra></extra>")
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key="m_stats_chart")
-    with g2:
-        st.dataframe(df_type, hide_index=True, width="stretch")
-
-    st.markdown("#### Мероприятия")
-    types = st.multiselect("Тип", db.EVENT_TYPES, key="m_stats_types",
-                           placeholder="Все типы")
-    rows = [r for r in by_event if not types or r["type"] in types]
-    st.dataframe(
-        pd.DataFrame(
-            [{"Название": r["title"], "Тип": r["type"], "Дата": str(r["event_date"]),
-              "Участников": r["participants_count"]} for r in rows],
-            columns=["Название", "Тип", "Дата", "Участников"],
-        ),
-        hide_index=True,
-        width="stretch",
-    )
+        with st.expander("➕ Добавить достижение", expanded=True):
+            ua.achievement_form("p_", user)
+        ua.member_list(user)
 
 
 # ── Admin: members ──────────────────────────────────────────────────────────
@@ -587,10 +403,12 @@ def admin_stats() -> None:
         key="stats_year",
     )
     y = year or None  # None → без фильтра
+    recs = ach.list_achievements(year=y)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Участий", db.count_participations(y))
-    c2.metric("Мероприятий", db.count_events(y), help="Мероприятия участников (без дублей)")
+    c1.metric("Достижений", len(recs), help="Все записи участников и СНО за период")
+    c2.metric("В годовом отчёте", sum(1 for r in recs if r["counted"]),
+              help="Записи с указанным уровнем/подпунктом (заочные доклады не считаются)")
     c3.metric("Заседаний", db.count_meetings(y, kind=db.DEFAULT_MEETING_KIND))
     c4.metric(
         "Других мероприятий СНО",
@@ -598,10 +416,13 @@ def admin_stats() -> None:
         help="Конференции, форумы, круглые столы и др. из вкладки «Заседания и мероприятия»",
     )
 
-    st.markdown("#### Участия по месяцам")
-    months = db.participations_by_month(y)
-    df_month = pd.DataFrame({"Месяц": list(ru_text.MONTHS_SHORT), "Участий": months})
-    fig_month = px.bar(df_month, x="Месяц", y="Участий")
+    st.markdown("#### Достижения по месяцам")
+    months = [0] * 12
+    for r in recs:
+        if r["date_from"] and (not y or r["date_from"][:4] == str(y)):
+            months[int(r["date_from"][5:7]) - 1] += 1
+    df_month = pd.DataFrame({"Месяц": list(ru_text.MONTHS_SHORT), "Достижений": months})
+    fig_month = px.bar(df_month, x="Месяц", y="Достижений")
     fig_month.update_layout(
         height=280,
         margin=dict(t=10, b=10, l=10, r=10),
@@ -614,399 +435,70 @@ def admin_stats() -> None:
     fig_month.update_traces(hovertemplate="%{x}: %{y}<extra></extra>")
     st.plotly_chart(fig_month, width="stretch", config={"displayModeBar": False})
     if year == ALL_TIME:
-        st.caption("За всё время: участия суммированы по месяцам всех лет.")
+        st.caption("За всё время: достижения суммированы по месяцам всех лет (по дате начала).")
 
-    by_person = db.stats_by_person(y)
+    by_person = ach.stats_by_person(y)
     st.markdown("#### Топ-5 активных")
-    top = [r for r in by_person if r["total"] > 0][:5]
+    top = by_person[:5]
     if top:
-        st.markdown(
-            "\n".join(
-                f"{i}. {r['full_name']} — {ru_text.with_count(r['total'], ru_text.PARTICIPATION_FORMS)}"
-                for i, r in enumerate(top, start=1)
-            )
-        )
+        st.markdown("\n".join(
+            f"{i}. {r['full_name']} — {ru_text.with_count(r['total'], ua.RECORD_FORMS)}"
+            for i, r in enumerate(top, start=1)))
     else:
-        st.caption("За выбранный период участий пока нет.")
+        st.caption("За выбранный период записей пока нет.")
 
     with st.expander("Подробнее"):
-        _stats_details(by_person, db.stats_by_type(y), db.stats_by_event(y))
-        st.markdown("#### Участия и номера в портфолио")
-        df_, dt_ = db.year_range(y)
-        parts = db.list_all_participations(date_from=df_, date_to=dt_)
-        if parts:
+        st.markdown("#### По показателям годового отчёта")
+        by_ind = ua._counts_by_indicator(y)
+        df_ind = pd.DataFrame(by_ind)
+        if not df_ind.empty and df_ind["Записей"].sum():
+            fig = px.bar(df_ind[df_ind["Записей"] > 0], x="Записей", y="Показатель", orientation="h",
+                         text="Записей")
+            fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(t=10, l=10),
+                              height=max(260, 30 * int((df_ind["Записей"] > 0).sum()) + 80))
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, width="stretch")
+        st.dataframe(df_ind, hide_index=True, width="stretch")
+
+        st.markdown("#### По участникам")
+        if by_person:
+            kinds = [k["label"] for k in ach.list_kinds(admin=True, include_hidden=True)]
+            used = [k for k in kinds if any(k in r["by_kind"] for r in by_person)]
+            st.dataframe(
+                pd.DataFrame([{"ФИО": r["full_name"], "Логин": r["login"], "Всего": r["total"],
+                               "В отчёте": r["counted"], **{k: r["by_kind"].get(k, 0) for k in used},
+                               "С номером / всего": f"{r['with_number']} / {r['total']}"} for r in by_person]),
+                width="stretch", hide_index=True)
+            df_stack = pd.DataFrame([{"ФИО": r["full_name"], "Вид": k, "Достижений": n}
+                                     for r in by_person for k, n in r["by_kind"].items()])
+            fig_stack = px.bar(df_stack, x="ФИО", y="Достижений", color="Вид", barmode="stack",
+                               title="Достижения участников по видам")
+            fig_stack.update_layout(xaxis_tickangle=-30, margin=dict(t=40, b=80))
+            st.plotly_chart(fig_stack, width="stretch")
+        else:
+            st.info("Нет записей за выбранный период.")
+
+        st.markdown("#### Достижения и номера в портфолио")
+        if recs:
             st.dataframe(
                 pd.DataFrame([
-                    {"ФИО": r["full_name"], "Мероприятие": r["title"], "Тип": r["type"],
-                     "Дата": str(r["event_date"]),
-                     "Номер в портфолио": r.get("achievement_number") or "",
-                     "Есть номер": bool(r.get("achievement_number"))}
-                    for r in parts
+                    {"ФИО": r["owner_name"] or "СНО", "Вид": r["kind_label"], "Название": r["title"],
+                     "Дата": ach.fmt_date(r["date_from"]),
+                     "Номер в портфолио": r["number"] or "", "Есть номер": bool(r["number"])}
+                    for r in recs
                 ]),
                 width="stretch",
                 hide_index=True,
                 column_config=_NUMBER_COLUMNS,
             )
         else:
-            st.caption("За выбранный период участий нет.")
-        st.markdown("#### Статьи по индексации")
-        by_idx = db.stats_articles_by_indexing(y)
-        if by_idx:
-            st.dataframe(
-                [{"Индексация": r["indexing"], "Статей": r["articles"], "Авторов (участий)": r["authors"]}
-                 for r in by_idx],
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.caption("Статей за выбранный период нет.")
-
-
-def _stats_details(by_person: list[dict], by_type: list[dict], by_event: list[dict]) -> None:
-    st.metric("Активных членов совета", len(by_person))
-
-    # ── Charts ──────────────────────────────────────────────────────────────
-    st.markdown("#### Графики")
-    if by_person or by_type or by_event:
-        g1, g2 = st.columns(2)
-
-        with g1:
-            if by_person:
-                df_person = pd.DataFrame(
-                    [
-                        {
-                            "ФИО": r["full_name"],
-                            "Участий": int(r["total"] or 0),
-                        }
-                        for r in by_person
-                    ]
-                )
-                fig_person = px.bar(
-                    df_person,
-                    x="ФИО",
-                    y="Участий",
-                    title="Участия по членам совета",
-                    text="Участий",
-                )
-                fig_person.update_layout(
-                    xaxis_tickangle=-30,
-                    margin=dict(t=40, b=80),
-                    showlegend=False,
-                )
-                fig_person.update_traces(textposition="outside")
-                st.plotly_chart(fig_person, width="stretch")
-            else:
-                st.info("Нет данных по членам совета для графика.")
-
-        with g2:
-            if by_type:
-                df_type = pd.DataFrame(
-                    [
-                        {
-                            "Тип": r["type"],
-                            "Участий": int(r["participations_count"] or 0),
-                            "Мероприятий": int(r["events_count"] or 0),
-                        }
-                        for r in by_type
-                    ]
-                )
-                fig_type = px.pie(
-                    df_type,
-                    names="Тип",
-                    values="Участий",
-                    title="Участия по типам мероприятий",
-                    hole=0.35,
-                )
-                fig_type.update_traces(textposition="inside", textinfo="percent+label",
-                                       marker_colors=brand.CHART_COLORS)
-                st.plotly_chart(fig_type, width="stretch")
-            else:
-                st.info("Нет данных по типам для графика.")
-
-        if by_event:
-            df_event = pd.DataFrame(
-                [
-                    {
-                        "Мероприятие": f'{r["title"]} ({r["event_date"]})',
-                        "Тип": r["type"],
-                        "Участников": int(r["participants_count"] or 0),
-                    }
-                    for r in by_event
-                ]
-            ).sort_values("Участников", ascending=False).head(15)
-            fig_event = px.bar(
-                df_event,
-                x="Участников",
-                y="Мероприятие",
-                color="Тип",
-                orientation="h",
-                title="Топ мероприятий по числу участников",
-                text="Участников",
-            )
-            fig_event.update_layout(
-                yaxis={"categoryorder": "total ascending"},
-                margin=dict(t=40, l=10),
-                height=max(320, 28 * len(df_event) + 100),
-            )
-            fig_event.update_traces(textposition="outside")
-            st.plotly_chart(fig_event, width="stretch")
-
-        if by_person:
-            df_stack = pd.DataFrame(
-                [
-                    {
-                        "ФИО": r["full_name"],
-                        "Гранты": int(r["grants"] or 0),
-                        "Конференции": int(r["conferences"] or 0),
-                        "Конкурсы": int(r["contests"] or 0),
-                        "Стипендии": int(r["scholarships"] or 0),
-                        "Статьи": int(r["articles"] or 0),
-                    }
-                    for r in by_person
-                ]
-            )
-            df_melt = df_stack.melt(
-                id_vars="ФИО", var_name="Тип", value_name="Участий"
-            )
-            fig_stack = px.bar(
-                df_melt,
-                x="ФИО",
-                y="Участий",
-                color="Тип",
-                title="Участия членов совета по типам",
-                barmode="stack",
-            )
-            fig_stack.update_layout(xaxis_tickangle=-30, margin=dict(t=40, b=80))
-            st.plotly_chart(fig_stack, width="stretch")
-    else:
-        st.info("Пока нет данных для графиков — добавьте участия.")
-
-    st.markdown("#### По участникам")
-    if by_person:
-        st.dataframe(
-            [
-                {
-                    "ФИО": r["full_name"],
-                    "Логин": r["login"],
-                    "Всего": r["total"] or 0,
-                    "Гранты": r["grants"] or 0,
-                    "Конференции": r["conferences"] or 0,
-                    "Конкурсы": r["contests"] or 0,
-                    "Стипендии": r["scholarships"] or 0,
-                    "Статьи": r["articles"] or 0,
-                    "С номером / всего": f"{r['with_number']} / {r['total'] or 0}",
-                }
-                for r in by_person
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.info("Нет активных членов совета.")
-
-    st.markdown("#### По типам мероприятий")
-    if by_type:
-        st.dataframe(
-            [
-                {
-                    "Тип": r["type"],
-                    "Мероприятий": r["events_count"],
-                    "Участий": r["participations_count"],
-                }
-                for r in by_type
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.info("Мероприятий пока нет.")
-
-    st.markdown("#### По мероприятиям")
-    if by_event:
-        st.dataframe(
-            [
-                {
-                    "Название": r["title"],
-                    "Тип": r["type"],
-                    "Дата": r["event_date"],
-                    "Участников": r["participants_count"],
-                }
-                for r in by_event
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-
-
-# ── Admin: all participations ───────────────────────────────────────────────
-
-
-def admin_all_participations() -> None:
-    st.subheader("Все участия")
-
-    with st.expander("➕ Добавить участие за участника"):
-        _admin_add_for_member()
-
-    members = db.list_users(active_only=False, role="member")
-    member_options = {0: "— все —"}
-    member_options.update({m["id"]: f"{m['full_name']} (@{m['login']})" for m in members})
-
-    events = db.stats_by_event()
-    event_options = {0: "— все —"}
-    event_options.update(
-        {
-            e["event_id"]: f"{e['title']} ({e['type']}, {e['event_date']})"
-            for e in events
-        }
-    )
-
-    f1, f2, f3, f4, f5, f6 = st.columns([3, 2, 3, 2, 2, 2])
-    with f1:
-        uid = st.selectbox(
-            "Участник",
-            options=list(member_options.keys()),
-            format_func=lambda x: member_options[x],
-            key="adm_filter_user",
-        )
-    with f2:
-        etype = st.selectbox("Тип", ["— все —", *db.EVENT_TYPES])
-    with f3:
-        eid = st.selectbox(
-            "Мероприятие",
-            options=list(event_options.keys()),
-            format_func=lambda x: event_options[x],
-        )
-    with f4:
-        date_from = st.date_input("Дата с", value=None)
-    with f5:
-        date_to = st.date_input("Дата по", value=None)
-    with f6:
-        st.write("")
-        no_ach = st.checkbox("Без номера достижения", key="filter_no_ach")
-
-    rows = db.list_all_participations(
-        user_id=uid if uid else None,
-        event_type=None if etype == "— все —" else etype,
-        event_id=eid if eid else None,
-        date_from=date_from.isoformat() if date_from else None,
-        date_to=date_to.isoformat() if date_to else None,
-        without_achievement=no_ach,
-    )
-
-    st.caption(f"Найдено: {len(rows)}")
-    if not rows:
-        st.info("Нет записей по выбранным фильтрам.")
-        return
-
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "ФИО": r["full_name"],
-                    "Логин": r["login"],
-                    "Мероприятие": r["title"],
-                    "Тип": r["type"],
-                    "Дата": str(r["event_date"]),
-                    "Номер в портфолио": r.get("achievement_number") or "",
-                    "Есть номер": bool(r.get("achievement_number")),
-                    "Индексация": r.get("indexing") or "",
-                    "Добавлено": r["joined_at"][:19],
-                }
-                for r in rows
-            ]
-        ),
-        width="stretch",
-        hide_index=True,
-        column_config=_NUMBER_COLUMNS,
-    )
-
-    st.markdown("#### Редактирование и удаление участия")
-    ids = {r["participation_id"]: f"{r['full_name']} — {r['title']} ({r['event_date']})" for r in rows}
-    if st.session_state.get("adm_pick") not in (0, *ids):
-        st.session_state["adm_pick"] = 0  # record deleted / filtered out
-    pick = st.selectbox("Выберите запись", options=[0, *ids.keys()],
-                        format_func=lambda x: "—" if x == 0 else ids[x], key="adm_pick")
-    _show_msgs("adm_p_msg")
-    if pick:
-        _admin_edit_participation(next(r for r in rows if r["participation_id"] == pick))
+            st.caption("За выбранный период записей нет.")
 
 
 _NUMBER_COLUMNS = {
     "Номер в портфолио": st.column_config.TextColumn("Номер в портфолио"),
     "Есть номер": st.column_config.CheckboxColumn("Есть номер", disabled=True),
 }
-
-
-def _admin_add_for_member() -> None:
-    users = db.list_users(active_only=True)
-    opts = {u["id"]: f"{u['full_name']} (@{u['login']})" for u in users}
-    if st.session_state.get("ap_user") not in (0, *opts):
-        st.session_state["ap_user"] = 0
-    st.selectbox("Участник", [0, *opts], key="ap_user",
-                 format_func=lambda x: "— выберите участника —" if x == 0 else opts[x])
-    _participation_form(None, "ap_")
-
-
-def _admin_edit_participation(r: dict) -> None:
-    pid, eid = r["participation_id"], r["event_id"]
-    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-    new_ach = c1.text_input(
-        "Номер в портфолио (номер достижения)", value=r.get("achievement_number") or "",
-        key=f"adm_ach_{pid}", max_chars=db.ACHIEVEMENT_MAX_LEN,
-    )
-    if c2.button("Сохранить номер", key=f"adm_ach_save_{pid}"):
-        try:
-            db.set_achievement_number(pid, new_ach)
-            st.session_state["adm_p_msg"] = ("success", "Номер достижения сохранён.")
-            st.rerun()
-        except ValueError as e:
-            st.error(str(e))
-
-    n = db.event_participants_count(eid)
-    with st.expander("✏️ Изменить мероприятие (название, тип, дата, тема, индексация)"):
-        if n > 1:
-            st.warning(f"Мероприятие общее для {n} участников — изменения затронут всех. "
-                       "Если такое мероприятие уже есть, записи будут объединены.")
-        with st.form(f"adm_ev_{eid}"):
-            title = st.text_input("Название", value=r["title"])
-            etype = st.selectbox("Тип мероприятия", db.EVENT_TYPES,
-                                 index=db.EVENT_TYPES.index(r["type"]) if r["type"] in db.EVENT_TYPES else 0,
-                                 format_func=lambda t: TYPE_LABELS.get(t, t))
-            ev_date = st.date_input("Дата", value=db._to_date(r["event_date"]), format="DD.MM.YYYY")
-            st.caption("Тема и индексация сохраняются только для типа «статья».")
-            topic = st.text_input("Тема статьи", value=r.get("article_topic") or "")
-            idx_opts = ["", *db.INDEXING_OPTIONS]
-            indexing = st.selectbox(
-                "Индексация", idx_opts,
-                index=idx_opts.index(r["indexing"]) if r.get("indexing") in idx_opts else 0,
-                format_func=lambda x: x or "— не указана —",
-            )
-            if st.form_submit_button("Сохранить мероприятие"):
-                try:
-                    res = db.update_event(eid, title, etype, ev_date, topic, indexing)
-                    st.session_state["adm_p_msg"] = (
-                        "success",
-                        "Мероприятие объединено с уже существующим." if res["merged"]
-                        else "Мероприятие сохранено.",
-                    )
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
-
-    if st.button("🗑 Удалить участие", key=f"adm_del_{pid}"):
-        st.session_state["confirm_admin_del_p"] = pid
-    if st.session_state.get("confirm_admin_del_p") == pid:
-        st.warning(f"Удалить участие «{r['full_name']}» в «{r['title']}»?"
-                   + (" Это последний участник — мероприятие тоже исчезнет." if n <= 1 else ""))
-        b1, b2, _ = st.columns([1, 1, 4])
-        if b1.button("Да, удалить", type="primary", key="admin_yes_del"):
-            db.delete_participation(pid)
-            st.session_state.pop("confirm_admin_del_p", None)
-            st.session_state["adm_p_msg"] = ("success", "Участие удалено.")
-            st.rerun()
-        if b2.button("Отмена", key="admin_no_del"):
-            st.session_state.pop("confirm_admin_del_p", None)
-            st.rerun()
 
 
 # ── Admin: meetings (заседания СНО) ─────────────────────────────────────────
@@ -1274,19 +766,8 @@ def admin_report() -> None:
             key="dl_report_docx",
         )
 
-    st.markdown("#### Выгрузка в Excel")
-    df, dt = db.year_range(year)
-    parts = db.list_all_participations(date_from=df, date_to=dt)
-    st.caption(
-        f"Все участия за {year} год ({len(parts)}) и список заседаний — на отдельных листах."
-    )
-    st.download_button(
-        "⬇️ Участия за год (.xlsx)",
-        data=report.build_year_xlsx(parts, meetings),
-        file_name=f"Участия_СНО_{year}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_year_xlsx",
-    )
+    st.divider()
+    ua.annual_report_section(_year_choices())
 
 
 # ── Admin: report settings ──────────────────────────────────────────────────
@@ -1325,10 +806,13 @@ def admin_settings() -> None:
     for sig in s["signatories"]:
         st.text(f"{sig['position']} {report.SIGNATURE_LINE}/{sig['name']}")
 
+    st.divider()
+    ua.catalog_editor()
+
 
 def admin_panel(user: dict) -> None:
     st.title("Панель лидера СНО")
-    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все участия", "Настройки"])
+    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все достижения", "Настройки"])
     with tabs[0]:
         admin_members(user)
     with tabs[1]:
@@ -1338,7 +822,7 @@ def admin_panel(user: dict) -> None:
     with tabs[3]:
         admin_report()
     with tabs[4]:
-        admin_all_participations()
+        ua.admin_achievements(user, _year_choices(include_all=True), _year_label)
     with tabs[5]:
         admin_settings()
 

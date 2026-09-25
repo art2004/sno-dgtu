@@ -2,7 +2,8 @@
 meetings CRUD, report settings, .docx/.xlsx report generation, year-filtered stats,
 signed «remember me» cookie tokens (expiry, tamper, password change, deletion),
 members import from Excel, orphan events cleanup, admin edit of shared events,
-portfolio numbers in stats, role changes with last-admin safeguards.
+portfolio numbers in stats, role changes with last-admin safeguards; annual report
+(catalog, achievements, counting, migration, .docx/.xlsx) — see smoke_annual.py.
 
 По умолчанию проверяет временную SQLite-базу (рабочая data/sno.db не трогается).
 
@@ -30,7 +31,8 @@ from auth import authenticate, change_password, hash_password, verify_password  
 def _reset_pg(target: str) -> None:
     with db.get_engine(target).begin() as conn:
         conn.execute(text(
-            "DROP TABLE IF EXISTS participations, events, users, meetings, settings CASCADE"
+            "DROP TABLE IF EXISTS achievement_people, achievements, kind_subpoints, kinds, "
+            "indicator_rows, indicators, participations, events, users, meetings, settings CASCADE"
         ))
 
 
@@ -470,8 +472,10 @@ def run_schema_upgrade(target) -> None:  # noqa: ANN001
         before = {t: conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
                   for t in ("users", "events", "participations")}
     with db.get_engine(target).begin() as conn:
-        conn.execute(text("DROP TABLE meetings"))
-        conn.execute(text("DROP TABLE settings"))
+        # a DB from before meetings/settings also has no annual-report tables
+        for t in ("achievement_people", "achievements", "kind_subpoints", "kinds", "indicator_rows",
+                  "indicators", "meetings", "settings"):
+            conn.execute(text(f"DROP TABLE {t}"))
     db.init_db(db_path=target, seed_admin=True)
     with db.get_engine(target).connect() as conn:
         after = {t: conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
@@ -756,6 +760,14 @@ def main() -> None:
         _reset_pg(pg_url)
         run_legacy_migration(pg_url)
         _reset_pg(pg_url)
+        import smoke_annual
+
+        def _fresh_pg() -> str:
+            _reset_pg(pg_url)
+            return pg_url
+
+        smoke_annual.run_all(_fresh_pg(), _fresh_pg)
+        _reset_pg(pg_url)
         print("OK (Postgres)")
         return
 
@@ -763,6 +775,9 @@ def main() -> None:
     # Without ADMIN_PASSWORD local SQLite falls back to admin123
     run(tmp, expect_admin_password=admin_pw_env or "admin123")
     run_legacy_migration(tmp.with_name("sno_legacy.db"))
+    import smoke_annual
+
+    smoke_annual.run_all(tmp.with_name("sno_annual.db"), lambda: tmp.with_name("sno_annual_mig.db"))
     print("OK")
     print(f"  smoke db: {tmp}")
 
