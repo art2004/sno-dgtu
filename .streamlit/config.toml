@@ -1,0 +1,23 @@
+# Фирменный стиль СНО «Сельское хозяйство» (ДГТУ): тёмно-зелёный из логотипа + золото из обложки ВК.
+[theme]
+base = "light"
+primaryColor = "#1B5E34"            # кнопки, акценты (белый текст на нём: контраст 7.8:1)
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F1E6" # поля ввода, фон виджетов (тёплый светлый)
+textColor = "#1C2B21"               # контраст 14.8:1 на белом
+linkColor = "#1B5E34"
+borderColor = "#E2DCC8"
+greenColor = "#2F7A3E"
+yellowColor = "#C9A94E"
+baseRadius = "0.6rem"
+buttonRadius = "0.6rem"
+showWidgetBorder = true
+font = "Montserrat:https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap"
+headingFont = "Unbounded:https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600&display=swap"
+headingFontWeights = [600, 600, 500, 500, 500, 500]
+chartCategoricalColors = ["#1B5E34", "#907436", "#5B9A45", "#C9A94E", "#0A3119", "#9CBF8B", "#6B5526", "#D9CBA0"]
+chartSequentialColors = ["#F4F1E6", "#E3E8D2", "#C9D9B4", "#A8C793", "#84B173", "#5F9955", "#3F7F3E", "#2A6A33", "#1B5E34", "#0A3119"]
+
+[theme.sidebar]
+backgroundColor = "#F4F1E6"
+secondaryBackgroundColor = "#FFFFFF"

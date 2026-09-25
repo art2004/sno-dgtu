@@ -10,13 +10,14 @@ import pandas as pd
 import plotly.express as px
 
 import auth
+import brand
 import db
 import report
 import ru_text
 
 st.set_page_config(
-    page_title="СНО ДГТУ — мероприятия",
-    page_icon="🎓",
+    page_title=brand.PAGE_TITLE,
+    page_icon=str(brand.ICON),
     layout="wide",
 )
 
@@ -116,9 +117,7 @@ def logout() -> None:
 
 
 def render_login() -> None:
-    st.title("СНО ДГТУ — учёт мероприятий")
-    st.caption("Студенческое научное общество · Донской государственный технический университет")
-    st.markdown("---")
+    brand.login_header(brand.sno_name(db))
 
     admin_status = db.ensure_admin()
     if admin_status == "missing_password":
@@ -718,7 +717,8 @@ def _stats_details(by_person: list[dict], by_type: list[dict], by_event: list[di
                     title="Участия по типам мероприятий",
                     hole=0.35,
                 )
-                fig_type.update_traces(textposition="inside", textinfo="percent+label")
+                fig_type.update_traces(textposition="inside", textinfo="percent+label",
+                                       marker_colors=brand.CHART_COLORS)
                 st.plotly_chart(fig_type, width="stretch")
             else:
                 st.info("Нет данных по типам для графика.")
@@ -1348,10 +1348,13 @@ def admin_panel(user: dict) -> None:
 
 def main() -> None:
     _ensure_session()
+    brand.inject_css()
+    brand.sidebar_logo()
     user = st.session_state.user
     if user is None:
         render_login()
     else:
+        brand.compact_header(brand.sno_name(db))
         render_sidebar(user)
         if user["role"] == "admin":
             admin_panel(user)
