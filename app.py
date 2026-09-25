@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 
 import streamlit as st
@@ -51,13 +52,56 @@ except Exception as exc:  # noqa: BLE001
     st.stop()
 
 
+def _session_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "login": user["login"],
+        "full_name": user["full_name"],
+        "role": user["role"],
+    }
+
+
 def _ensure_session() -> None:
     if "user" not in st.session_state:
         st.session_state.user = None
+    # Page refresh = new session: restore login from the signed cookie. It is read
+    # server-side from the request (st.context.cookies), so it is available on the
+    # very first run — no flash of the login form. After «Выйти» the browser may
+    # still have sent the old cookie with this connection, hence the flag.
+    if st.session_state.user is None and not st.session_state.get("_cookie_logged_out"):
+        user = auth.user_from_token(st.context.cookies.get(auth.COOKIE_NAME))
+        if user is not None:
+            st.session_state.user = _session_user(user)
+
+
+def _queue_auth_cookie(user_id: int | None) -> None:
+    """Schedule setting (fresh token for user_id) or deleting (None) the cookie."""
+    token = None
+    if user_id is not None:
+        user = db.get_user_by_id(user_id)
+        token = auth.make_auth_token(user) if user else None
+    st.session_state["_cookie_op"] = {"token": token}
+
+
+def _apply_cookie_op() -> None:
+    """Write/delete the cookie in the browser (st.html with JS, no extra package)."""
+    op = st.session_state.pop("_cookie_op", None)
+    if op is None:
+        return
+    token = op["token"]
+    value, max_age = (token, auth.COOKIE_TTL_SECONDS) if token else ("", 0)
+    cookie = f"{auth.COOKIE_NAME}={value}; Max-Age={max_age}; Path=/; SameSite=Lax"
+    st.html(
+        "<script>document.cookie = " + json.dumps(cookie)
+        + " + (location.protocol === 'https:' ? '; Secure' : '');</script>",
+        unsafe_allow_javascript=True,
+    )
 
 
 def logout() -> None:
     st.session_state.user = None
+    st.session_state["_cookie_logged_out"] = True
+    _queue_auth_cookie(None)
     st.rerun()
 
 
@@ -89,12 +133,9 @@ def render_login() -> None:
                 if user is None:
                     st.error("Неверный логин или пароль, либо учётная запись отключена.")
                 else:
-                    st.session_state.user = {
-                        "id": user["id"],
-                        "login": user["login"],
-                        "full_name": user["full_name"],
-                        "role": user["role"],
-                    }
+                    st.session_state.user = _session_user(user)
+                    st.session_state.pop("_cookie_logged_out", None)
+                    _queue_auth_cookie(user["id"])
                     st.rerun()
 
 
@@ -117,6 +158,8 @@ def render_sidebar(user: dict) -> None:
                 if st.form_submit_button("Сменить пароль", width="stretch"):
                     ok, msg = auth.change_password(user["id"], current, new, repeat)
                     (st.success if ok else st.error)(msg)
+                    if ok:  # old cookies are now invalid → fresh one for this browser
+                        _queue_auth_cookie(user["id"])
         st.caption(f"База данных: {db.backend_name()}")
 
 
@@ -292,6 +335,9 @@ def admin_members(user: dict) -> None:
                     except db.DuplicateError:
                         st.error("Логин уже занят.")
 
+    with st.expander("📥 Импорт из Excel", expanded=False):
+        _import_members_ui()
+
     users = db.list_users()
     st.markdown(f"**Всего:** {len(users)}")
 
@@ -324,6 +370,8 @@ def admin_members(user: dict) -> None:
                                 password=new_password if new_password else None,
                                 active=new_active,
                             )
+                            if u["id"] == user["id"] and new_password:
+                                _queue_auth_cookie(user["id"])  # keep own login
                             st.success("Сохранено.")
                             st.rerun()
                         except db.DuplicateError:
@@ -348,6 +396,46 @@ def admin_members(user: dict) -> None:
                 if b2.button("Отмена", key=f"no_u_{u['id']}"):
                     st.session_state.pop(confirm_key, None)
                     st.rerun()
+
+
+def _import_members_ui() -> None:
+    st.caption(
+        "Файл .xlsx, в первой строке заголовки: **ФИО**, **Логин**, **Пароль**. "
+        "Участники создаются с ролью «член совета»; существующие логины "
+        "пропускаются, их данные не меняются."
+    )
+    _show_msgs("import_msg")
+    up = st.file_uploader("Файл Excel (.xlsx)", type=["xlsx"], key="import_xlsx")
+    if up is None:
+        return
+    try:
+        rows = db.parse_members_xlsx(up.getvalue())
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    if not rows:
+        st.info("В файле нет строк с участниками.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [{"Строка": r["row"], "ФИО": r["full_name"], "Логин": r["login"],
+              "Статус": r["status"]} for r in rows]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    n_new = sum(r["ok"] for r in rows)
+    if n_new == 0:
+        st.info("Новых участников для создания нет.")
+        return
+    label = f"Создать {n_new} {ru_text.plural(n_new, ('участника', 'участников', 'участников'))}"
+    if st.button(label, type="primary", key="import_go"):
+        with st.spinner("Создаю учётные записи…"):
+            created, skipped = db.import_members(rows)
+        st.session_state["import_msg"] = (
+            "success", f"Импорт завершён: создано {created}, пропущено {skipped}."
+        )
+        st.rerun()
 
 
 # ── Admin: stats ────────────────────────────────────────────────────────────
@@ -1038,13 +1126,13 @@ def main() -> None:
     user = st.session_state.user
     if user is None:
         render_login()
-        return
-
-    render_sidebar(user)
-    if user["role"] == "admin":
-        admin_panel(user)
     else:
-        member_cabinet(user)
+        render_sidebar(user)
+        if user["role"] == "admin":
+            admin_panel(user)
+        else:
+            member_cabinet(user)
+    _apply_cookie_op()
 
 
 if __name__ == "__main__":

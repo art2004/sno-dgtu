@@ -1,5 +1,7 @@
 """Smoke-test: admin seed, member create, event add, dedup, cascade, password change,
-meetings CRUD, report settings, .docx/.xlsx report generation, year-filtered stats.
+meetings CRUD, report settings, .docx/.xlsx report generation, year-filtered stats,
+signed «remember me» cookie tokens (expiry, tamper, password change, deletion),
+members import from Excel.
 
 По умолчанию проверяет временную SQLite-базу (рабочая data/sno.db не трогается).
 
@@ -132,6 +134,8 @@ def run(target, expect_admin_password: str) -> None:  # noqa: ANN001
     run_new_types_and_achievements(target)
     run_activity_kinds(target)
     run_schema_upgrade(target)
+    run_auth_cookie(target)
+    run_members_import(target)
 
     assert db.normalize_title("  Foo   BAR ") == "foo bar"
     assert verify_password("x", hash_password("x"))
@@ -470,6 +474,127 @@ def run_schema_upgrade(target) -> None:  # noqa: ANN001
     assert db.get_report_settings(db_path=target)["sno_name"] == db.DEFAULT_SNO_NAME
     db.init_db(db_path=target)  # idempotent
     print(f"  schema upgrade OK (rows preserved: {after})")
+
+
+def run_auth_cookie(target) -> None:  # noqa: ANN001
+    import time
+
+    import auth
+
+    saved_secret = os.environ.pop("COOKIE_SECRET", None)
+    auth._SECRETS_CACHE.clear()
+    key1 = auth.get_cookie_secret(target)
+    auth._SECRETS_CACHE.clear()
+    assert auth.get_cookie_secret(target) == key1, "stored key must be stable"
+    assert len(key1) >= 32
+    assert db.get_app_setting("cookie_secret", db_path=target) == key1.decode()
+
+    uid = db.create_user("cookie_u", "cookiepass1", "Куки К.К.", db_path=target)
+    user = db.get_user_by_id(uid, db_path=target)
+    tok = auth.make_auth_token(user, db_path=target)
+    assert "cookiepass1" not in tok and user["password_hash"] not in tok
+    assert auth.user_from_token(tok, db_path=target)["id"] == uid
+    # expiry: valid at +29 days, invalid after 30 days
+    now = time.time()
+    assert auth.user_from_token(tok, db_path=target, now=now + 29 * 86400) is not None
+    assert auth.user_from_token(tok, db_path=target, now=now + 30 * 86400 + 5) is None
+    old = auth.make_auth_token(user, db_path=target, now=now - 31 * 86400)
+    assert auth.user_from_token(old, db_path=target) is None
+    # tamper: other user id / later expiry / garbage
+    u_, e_, f_, s_ = tok.split(".")
+    admin_id = db.get_user_by_login(os.environ.get("ADMIN_LOGIN") or "admin", db_path=target)["id"]
+    for bad in (
+        f"{admin_id}.{e_}.{f_}.{s_}", f"{u_}.{int(e_) + 999999}.{f_}.{s_}",
+        f"{u_}.{e_}.{f_}.{'0' * len(s_)}", tok[:-1] + ("0" if tok[-1] != "0" else "1"),
+        "", "abc", "1.2.3", None, "x.y.z.w",
+    ):
+        assert auth.user_from_token(bad, db_path=target) is None, bad
+    # token signed with another key is rejected
+    os.environ["COOKIE_SECRET"] = "some-other-secret-value-for-test-1234567890"
+    try:
+        assert auth.user_from_token(tok, db_path=target) is None
+        tok_env = auth.make_auth_token(user, db_path=target)
+        assert auth.user_from_token(tok_env, db_path=target)["id"] == uid
+    finally:
+        os.environ.pop("COOKIE_SECRET")
+    assert auth.user_from_token(tok_env, db_path=target) is None
+    # own password change invalidates old tokens; a fresh one works
+    ok, _ = change_password(uid, "cookiepass1", "cookiepass2", "cookiepass2", db_path=target)
+    assert ok
+    assert auth.user_from_token(tok, db_path=target) is None
+    fresh = auth.make_auth_token(db.get_user_by_id(uid, db_path=target), db_path=target)
+    assert auth.user_from_token(fresh, db_path=target)["id"] == uid
+    # admin resets password → invalid; disabled → invalid; deleted → invalid
+    db.update_user(uid, password="cookiepass3", db_path=target)
+    assert auth.user_from_token(fresh, db_path=target) is None
+    fresh = auth.make_auth_token(db.get_user_by_id(uid, db_path=target), db_path=target)
+    db.update_user(uid, full_name="Куки2", login="cookie_u2", db_path=target)
+    assert auth.user_from_token(fresh, db_path=target) is not None, "rename keeps cookie"
+    db.update_user(uid, active=False, db_path=target)
+    assert auth.user_from_token(fresh, db_path=target) is None
+    db.update_user(uid, active=True, db_path=target)
+    assert auth.user_from_token(fresh, db_path=target) is not None
+    db.delete_user(uid, db_path=target)
+    assert auth.user_from_token(fresh, db_path=target) is None
+    if saved_secret is not None:
+        os.environ["COOKIE_SECRET"] = saved_secret
+    auth._SECRETS_CACHE.clear()
+    print("  auth cookie tokens OK (expiry, tamper, key, password change, disable, delete)")
+
+
+def run_members_import(target) -> None:  # noqa: ANN001
+    import io
+
+    import openpyxl
+
+    def xlsx(rows):  # noqa: ANN001, ANN202
+        wb = openpyxl.Workbook()
+        for r in rows:
+            wb.active.append(r)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    db.create_user("imp_exist", "existpass1", "Уже Есть", db_path=target)
+    old_hash = db.get_user_by_login("imp_exist", db_path=target)["password_hash"]
+    data = xlsx([
+        ["  логин ", "ПАРОЛЬ", "фио", "лишний"],  # any order / case / spaces
+        ["imp_a", "passA1234", "Альфа А.А.", "x"],
+        ["imp_b", 12345678, "Бета Б.Б.", None],  # numeric password
+        ["imp_exist", "newpass999", "Чужой", None],  # existing → skip, untouched
+        ["imp_a", "other", "Дубль", None],  # duplicate in file
+        ["", "p", "Без логина", None],
+        ["imp_c", None, "Без пароля", None],
+        [None, None, None, None],  # blank row ignored
+        ["bad login", "pass12345", "Пробел", None],
+        ["кириллица", "pass12345", "Кир", None],
+    ])
+    rows = db.parse_members_xlsx(data, db_path=target)
+    st_ = {r["row"]: r["status"] for r in rows}
+    assert st_ == {
+        2: db.ST_CREATE, 3: db.ST_CREATE, 4: db.ST_EXISTS, 5: db.ST_DUP,
+        6: db.ST_EMPTY, 7: db.ST_EMPTY, 9: db.ST_BAD_LOGIN, 10: db.ST_BAD_LOGIN,
+    }, st_
+    assert db.import_members(rows, db_path=target) == (2, 6)
+    b = db.get_user_by_login("imp_b", db_path=target)
+    assert b["role"] == "member" and b["active"] and b["full_name"] == "Бета Б.Б."
+    assert b["password_hash"] != "12345678" and verify_password("12345678", b["password_hash"])
+    a = db.get_user_by_login("imp_a", db_path=target)
+    assert a["full_name"] == "Альфа А.А." and verify_password("passA1234", a["password_hash"])
+    ex = db.get_user_by_login("imp_exist", db_path=target)
+    assert ex["password_hash"] == old_hash and ex["full_name"] == "Уже Есть"
+    rows2 = db.parse_members_xlsx(data, db_path=target)  # second import: nothing new
+    assert not any(r["ok"] for r in rows2)
+    assert db.import_members(rows2, db_path=target) == (0, 8)
+    for bad in (b"not an xlsx", xlsx([["ФИО", "Логин"], ["a", "b"]])):
+        try:
+            db.parse_members_xlsx(bad, db_path=target)
+            raise AssertionError("ValueError expected")
+        except ValueError:
+            pass
+    for login in ("imp_a", "imp_b", "imp_exist"):
+        db.delete_user(db.get_user_by_login(login, db_path=target)["id"], db_path=target)
+    print("  members import OK (statuses, create, skip existing, second import, bad file)")
 
 
 def main() -> None:

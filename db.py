@@ -501,6 +501,99 @@ def delete_user(user_id: int, db_path: DbTarget = None) -> None:
 # ── Events & participations ─────────────────────────────────────────────────
 
 
+
+# ── Import members from Excel ───────────────────────────────────────────────
+
+IMPORT_COLUMNS = {"фио": "full_name", "логин": "login", "пароль": "password"}
+LOGIN_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+ST_CREATE = "будет создан"
+ST_EXISTS = "логин уже есть — пропуск"
+ST_EMPTY = "ошибка: пустое поле"
+ST_DUP = "ошибка: дубль в файле"
+ST_BAD_LOGIN = "ошибка: недопустимый логин"
+
+
+def _cell_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)  # 12345.0 → "12345" (numeric passwords/logins)
+    return str(value).strip()
+
+
+def parse_members_xlsx(data: bytes, db_path: DbTarget = None) -> list[dict]:
+    """Rows of an .xlsx with headers ФИО / Логин / Пароль (row 1, any order/case).
+
+    Returns [{row, full_name, login, password, status, ok}], nothing is written.
+    Raises ValueError (Russian message) if the file or headers are wrong.
+    """
+    import io
+
+    import openpyxl
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Не удалось прочитать файл Excel: {exc.__class__.__name__}") from exc
+    try:
+        rows = list(wb.worksheets[0].iter_rows(values_only=True))
+    finally:
+        wb.close()
+    if not rows:
+        raise ValueError("Файл пустой.")
+    header = [_cell_str(h).lower() for h in rows[0]]
+    idx = {}
+    for i, h in enumerate(header):
+        if h in IMPORT_COLUMNS and IMPORT_COLUMNS[h] not in idx:
+            idx[IMPORT_COLUMNS[h]] = i
+    missing = [name for name, field in (("ФИО", "full_name"), ("Логин", "login"),
+                                        ("Пароль", "password")) if field not in idx]
+    if missing:
+        raise ValueError("В первой строке нет столбцов: " + ", ".join(missing)
+                         + ". Нужны заголовки ФИО, Логин, Пароль.")
+    with get_engine(db_path).connect() as conn:
+        existing = set(conn.execute(text("SELECT login FROM users")).scalars().all())
+    out: list[dict] = []
+    seen: set[str] = set()
+    for n, r in enumerate(rows[1:], start=2):
+        vals = {f: _cell_str(r[i] if i < len(r) else None) for f, i in idx.items()}
+        if not any(vals.values()):
+            continue  # blank row
+        login = vals["login"]
+        if not all(vals.values()):
+            status = ST_EMPTY
+        elif not LOGIN_RE.match(login):
+            status = ST_BAD_LOGIN
+        elif login in seen:
+            status = ST_DUP
+        elif login in existing:
+            status = ST_EXISTS
+        else:
+            status = ST_CREATE
+        if login:
+            seen.add(login)
+        out.append({"row": n, **vals, "status": status, "ok": status == ST_CREATE})
+    return out
+
+
+def import_members(rows: list[dict], db_path: DbTarget = None) -> tuple[int, int]:
+    """Create role=member users for rows marked ok. Existing logins are never
+    touched. Returns (created, skipped)."""
+    created = skipped = 0
+    for r in rows:
+        if not r.get("ok"):
+            skipped += 1
+            continue
+        if get_user_by_login(r["login"], db_path=db_path) is not None:
+            skipped += 1
+            continue
+        try:
+            create_user(r["login"], r["password"], r["full_name"], "member", db_path=db_path)
+            created += 1
+        except DuplicateError:  # created concurrently
+            skipped += 1
+    return created, skipped
+
 def normalize_achievement(value: Optional[str]) -> Optional[str]:
     """Номер достижения: обычная строка, strip, не длиннее 64 символов; пусто → NULL."""
     value = (value or "").strip()
