@@ -1194,21 +1194,33 @@ def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> lis
     return rows
 
 
-def events_overview(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
-    """Event-level list for members (no names): records grouped by kind + title + date."""
+def events_overview(year: Optional[int] = None, db_path: DbTarget = None,
+                    with_names: bool = False) -> list[dict]:
+    """Event-level list: records grouped by kind + title + date.
+
+    Members get no names; with_names=True (admin only) adds "names" (members + externals).
+    """
     recs = list_achievements(year=year, db_path=db_path)
     groups: dict[tuple, dict] = {}
     for r in recs:
         key = (r["kind_label"], normalize_title(r["title"]), r["date_from"])
         g = groups.setdefault(key, {"title": r["title"], "kind": r["kind_label"],
-                                    "date": r["date_from"], "records": 0, "people": set()})
+                                    "date": r["date_from"], "records": 0, "people": set(),
+                                    "names": []})
         g["records"] += 1
+        for nm in people_names(r):
+            if nm not in g["names"]:
+                g["names"].append(nm)
         if r["owner_id"]:
             g["people"].add(r["owner_id"])
         for p in r["people"]:
             if p["user_id"]:
                 g["people"].add(p["user_id"])
+    # "people" = distinct members; "names" (admin only) also lists external co-authors
     out = [{**g, "people": len(g["people"])} for g in groups.values()]
+    if not with_names:
+        for g in out:
+            g.pop("names", None)
     out.sort(key=lambda g: (g["date"] or "", g["title"].lower()), reverse=True)
     return out
 

@@ -452,6 +452,22 @@ def admin_stats() -> None:
     else:
         st.caption("За выбранный период записей пока нет.")
 
+    st.markdown("#### Участие по мероприятиям")
+    events = ach.events_overview(y, with_names=True)
+    if events:
+        ev_types = sorted({e["kind"] for e in events})
+        sel = st.multiselect("Вид", ev_types, key="stats_ev_types", placeholder="Все виды")
+        rows = [e for e in events if not sel or e["kind"] in sel]
+        st.caption(f"Мероприятий и работ: {len(rows)}, участий членов СНО: {sum(e['people'] for e in rows)}")
+        st.dataframe(
+            pd.DataFrame([{"Название": e["title"], "Вид": e["kind"], "Дата": ach.fmt_date(e["date"]),
+                           "Участников": e["people"], "Кто участвовал": ", ".join(e["names"])}
+                          for e in rows],
+                         columns=["Название", "Вид", "Дата", "Участников", "Кто участвовал"]),
+            hide_index=True, width="stretch")
+    else:
+        st.caption("За выбранный период мероприятий пока нет.")
+
     with st.expander("Подробнее"):
         st.markdown("#### По показателям годового отчёта")
         by_ind = ua._counts_by_indicator(y)
