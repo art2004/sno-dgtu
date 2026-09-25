@@ -472,6 +472,7 @@ def _share_str(v: Optional[float]) -> str:
 # ── Catalog reads & admin edits ─────────────────────────────────────────────
 
 
+@db.cached
 def catalog(db_path: DbTarget = None, include_hidden: bool = True) -> list[dict]:
     """Indicators ordered, each with 'rows' (ordered) and 'records' count."""
     with _eng(db_path).connect() as conn:
@@ -497,6 +498,7 @@ def catalog(db_path: DbTarget = None, include_hidden: bool = True) -> list[dict]
     return out
 
 
+@db.cached
 def indicator_rows(indicator_id: int, db_path: DbTarget = None, include_hidden: bool = False) -> list[dict]:
     with _eng(db_path).connect() as conn:
         return _rows(conn.execute(text(
@@ -505,25 +507,32 @@ def indicator_rows(indicator_id: int, db_path: DbTarget = None, include_hidden: 
             {"i": indicator_id}))
 
 
-def list_kinds(db_path: DbTarget = None, admin: bool = False, include_hidden: bool = False) -> list[dict]:
-    sql = "SELECT * FROM kinds WHERE 1=1"
-    if not admin:
-        sql += " AND admin_only = 0"
-    if not include_hidden:
-        sql += " AND hidden = 0"
+@db.cached
+def _all_kinds(db_path: DbTarget = None) -> list[dict]:
     with _eng(db_path).connect() as conn:
-        kinds = _rows(conn.execute(text(sql + " ORDER BY sort_order, id")))
+        kinds = _rows(conn.execute(text("SELECT * FROM kinds ORDER BY sort_order, id")))
         subs = _rows(conn.execute(text("SELECT * FROM kind_subpoints ORDER BY sort_order, id")))
     for k in kinds:
-        k["subpoints"] = [s for s in subs if s["kind_id"] == k["id"] and (include_hidden or not s["hidden"])]
+        k["subpoints"] = [sp for sp in subs if sp["kind_id"] == k["id"]]
     return kinds
 
 
+def list_kinds(db_path: DbTarget = None, admin: bool = False, include_hidden: bool = False) -> list[dict]:
+    kinds = [k for k in _all_kinds(db_path)
+             if (admin or not k["admin_only"]) and (include_hidden or not k["hidden"])]
+    if not include_hidden:
+        for k in kinds:
+            k["subpoints"] = [sp for sp in k["subpoints"] if not sp["hidden"]]
+    return kinds
+
+
+@db.cached
 def get_kind(kind_id: int, db_path: DbTarget = None) -> Optional[dict]:
     kinds = [k for k in list_kinds(db_path, admin=True, include_hidden=True) if k["id"] == kind_id]
     return kinds[0] if kinds else None
 
 
+@db.cached
 def kind_by_code(code: str, db_path: DbTarget = None) -> dict:
     for k in list_kinds(db_path, admin=True, include_hidden=True):
         if k["code"] == code:
@@ -531,6 +540,7 @@ def kind_by_code(code: str, db_path: DbTarget = None) -> dict:
     raise KeyError(code)
 
 
+@db.cached
 def row_by_code(code: str, db_path: DbTarget = None) -> dict:
     with _eng(db_path).connect() as conn:
         r = _one(conn.execute(text("SELECT * FROM indicator_rows WHERE code = :c"), {"c": code}))
@@ -776,6 +786,7 @@ def resolve_target(kind: dict, subpoint_id: Optional[int], row_id: Optional[int]
     return kind["indicator_id"], row_id, kind["form"]
 
 
+@db.cached
 def find_duplicate_publication(title: str, year: Optional[int], doi: Optional[str],
                                exclude_id: Optional[int] = None, db_path: DbTarget = None) -> Optional[dict]:
     doi_n = normalize_doi(doi)
@@ -1076,6 +1087,7 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
     return recs
 
 
+@db.cached
 def get_achievement(achievement_id: Optional[int], db_path: DbTarget = None) -> Optional[dict]:
     if not achievement_id:
         return None
@@ -1093,6 +1105,7 @@ def year_cond(year: Optional[int], alias: str = "a") -> tuple[str, dict]:
             {"y_from": f"{int(year):04d}-01-01", "y_to": f"{int(year):04d}-12-31"})
 
 
+@db.cached
 def list_achievements(owner_id: Optional[int] = None, year: Optional[int] = None,
                       indicator_id: Optional[int] = None, row_id: Optional[int] = None,
                       kind_id: Optional[int] = None, without_number: bool = False,
@@ -1166,6 +1179,7 @@ def record_issues(r: dict) -> list[str]:
 # ── Summaries & stats ───────────────────────────────────────────────────────
 
 
+@db.cached
 def member_year_summary(owner_id: int, year: int, db_path: DbTarget = None) -> list[tuple[str, int]]:
     recs = list_achievements(owner_id=owner_id, year=year, db_path=db_path)
     counts: dict[str, int] = {}
@@ -1175,6 +1189,7 @@ def member_year_summary(owner_id: int, year: int, db_path: DbTarget = None) -> l
     return sorted(counts.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else 99)
 
 
+@db.cached
 def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     """Per member: total records, counted in report, with number, by kind."""
     users = db.list_users(active_only=False, db_path=db_path)
@@ -1194,6 +1209,7 @@ def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> lis
     return rows
 
 
+@db.cached
 def events_overview(year: Optional[int] = None, db_path: DbTarget = None,
                     with_names: bool = False) -> list[dict]:
     """Event-level list: records grouped by kind + title + date.
@@ -1225,6 +1241,7 @@ def events_overview(year: Optional[int] = None, db_path: DbTarget = None,
     return out
 
 
+@db.cached
 def available_years(db_path: DbTarget = None) -> list[int]:
     years: set[int] = set()
     with _eng(db_path).connect() as conn:
@@ -1364,6 +1381,7 @@ def _items(recs: list[dict], sno_name: str) -> list[tuple]:
     return [("line", record_line(r, sno_name)) for r in recs]
 
 
+@db.cached
 def report_data(year: int, db_path: DbTarget = None) -> dict:
     """Everything for the annual report: indicators with counts and detail items, warnings."""
     sno_name = db.get_report_settings(db_path=db_path)["sno_name"]
@@ -1406,6 +1424,7 @@ def report_data(year: int, db_path: DbTarget = None) -> dict:
 # ── Conclusion text per year ────────────────────────────────────────────────
 
 
+@db.cached
 def get_conclusion(year: int, db_path: DbTarget = None) -> str:
     return db.get_app_setting(f"annual_conclusion_{int(year)}", "", db_path=db_path) or ""
 

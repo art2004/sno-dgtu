@@ -11,7 +11,11 @@ to the SQLAlchemy psycopg 3 driver (postgresql+psycopg://...).
 
 from __future__ import annotations
 
+import copy
+import functools
+import inspect as _pyinspect
 import json
+import threading
 import os
 import re
 import time
@@ -135,8 +139,89 @@ def get_engine(db_path: DbTarget = None) -> Engine:
     else:
         # Neon closes idle connections; pre_ping + recycle keep the pool healthy.
         eng = create_engine(url, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=5)
+    _watch_writes(eng, url)
     _ENGINES[url] = eng
     return eng
+
+
+# ── Read cache (process-wide, invalidated by any write) ─────────────────────
+# Streamlit reruns the whole script on every click and renders all tabs, so the
+# same read-mostly queries ran dozens of times per click (≈100 ms each to Neon).
+# Reads decorated with @cached are memoized per database URL. Every non-SELECT
+# statement on an engine created here bumps that URL's data version (and once
+# more when the dirty connection returns to the pool, i.e. after commit), so a
+# write by any session in this process is visible to all sessions immediately.
+# CACHE_TTL bounds staleness for writes from other processes.
+
+CACHE_TTL = 60.0
+_CACHE: dict[tuple, tuple[int, float, Any]] = {}
+_VERSIONS: dict[str, int] = {}
+_CACHE_LOCK = threading.Lock()
+_READ_PREFIXES = ("SELECT", "PRAGMA", "SHOW")
+
+
+def bump_data_version(db_path: Any = None) -> None:
+    """Invalidate cached reads for one database (or all when db_path is '*')."""
+    with _CACHE_LOCK:
+        if db_path == "*":
+            urls = set(_VERSIONS) | {k[0] for k in _CACHE}
+        else:
+            urls = {_cache_url(db_path)}
+        for url in urls:
+            _VERSIONS[url] = _VERSIONS.get(url, 0) + 1
+        for k in [k for k in _CACHE if k[0] in urls]:
+            _CACHE.pop(k, None)
+
+
+def clear_cache() -> None:
+    bump_data_version("*")
+
+
+def _watch_writes(eng: Engine, url: str) -> None:
+    @event.listens_for(eng, "after_cursor_execute")
+    def _after(conn, _cur, statement, _params, _ctx, _many):  # noqa: ANN001
+        if not statement.lstrip().upper().startswith(_READ_PREFIXES):
+            conn.info["sno_dirty"] = True
+            bump_data_version(url)
+
+    @event.listens_for(eng.pool, "checkin")
+    def _checkin(_dbapi_conn, record):  # noqa: ANN001
+        if record is not None and record.info.pop("sno_dirty", False):
+            bump_data_version(url)  # after commit/rollback: drop reads cached meanwhile
+
+
+def _cache_url(db_path: Any) -> str:
+    if isinstance(db_path, Engine):
+        return db_path.url.render_as_string(hide_password=False)
+    return resolve_url(db_path)
+
+
+def cached(fn):  # noqa: ANN001, ANN201
+    """Memoize a read-only function by (db url, arguments); returns deep copies."""
+    sig = _pyinspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        target = arguments.pop("db_path", None)
+        if isinstance(target, Engine) and target not in _ENGINES.values():
+            return fn(*args, **kwargs)  # engine without write watcher → no caching
+        url = _cache_url(target)
+        key = (url, fn.__module__, fn.__qualname__, repr(sorted(arguments.items())))
+        version = _VERSIONS.get(url, 0)
+        hit = _CACHE.get(key)
+        if hit is not None and hit[0] == version and time.monotonic() - hit[1] < CACHE_TTL:
+            return copy.deepcopy(hit[2])
+        value = fn(*args, **kwargs)
+        with _CACHE_LOCK:
+            if _VERSIONS.get(url, 0) == version:  # no write happened while reading
+                _CACHE[key] = (version, time.monotonic(), copy.deepcopy(value))
+        return value
+
+    wrapper.uncached = fn
+    return wrapper
 
 
 def is_postgres(db_path: DbTarget = None) -> bool:
@@ -347,6 +432,7 @@ def init_db(
     Retries on connection errors (Neon free tier wakes up from suspend in a few
     seconds): `attempts` tries, sleeping backoff, 2*backoff, ... between them.
     """
+    bump_data_version(db_path)
     for attempt in range(1, attempts + 1):
         try:
             _create_schema(db_path)
@@ -359,6 +445,7 @@ def init_db(
             time.sleep(backoff * attempt)
 
 
+@cached
 def admin_exists(db_path: DbTarget = None) -> bool:
     with get_engine(db_path).connect() as conn:
         return conn.execute(
@@ -440,6 +527,7 @@ def create_user(
         )
 
 
+@cached
 def get_user_by_login(login: str, db_path: DbTarget = None) -> Optional[dict]:
     with get_engine(db_path).connect() as conn:
         return _one(conn.execute(
@@ -447,6 +535,7 @@ def get_user_by_login(login: str, db_path: DbTarget = None) -> Optional[dict]:
         ))
 
 
+@cached
 def get_user_by_id(user_id: int, db_path: DbTarget = None) -> Optional[dict]:
     with get_engine(db_path).connect() as conn:
         return _one(conn.execute(
@@ -454,6 +543,7 @@ def get_user_by_id(user_id: int, db_path: DbTarget = None) -> Optional[dict]:
         ))
 
 
+@cached
 def list_users(
     active_only: bool = False,
     role: Optional[str] = None,
@@ -945,6 +1035,7 @@ def update_event(
         return {"event_id": target, "merged": True}
 
 
+@cached
 def event_participants_count(event_id: int, db_path: DbTarget = None) -> int:
     with get_engine(db_path).connect() as conn:
         return int(conn.execute(
@@ -952,6 +1043,7 @@ def event_participants_count(event_id: int, db_path: DbTarget = None) -> int:
         ).scalar_one())
 
 
+@cached
 def list_participations_for_user(user_id: int, db_path: DbTarget = None) -> list[dict]:
     with get_engine(db_path).connect() as conn:
         return _rows(conn.execute(
@@ -971,6 +1063,7 @@ def list_participations_for_user(user_id: int, db_path: DbTarget = None) -> list
         ))
 
 
+@cached
 def list_all_participations(
     user_id: Optional[int] = None,
     event_type: Optional[str] = None,
@@ -1028,6 +1121,7 @@ def _event_filter(year: Optional[int], alias: str = "e") -> tuple[str, dict]:
     return f" AND {alias}.event_date >= :df AND {alias}.event_date <= :dt", {"df": df, "dt": dt}
 
 
+@cached
 def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
@@ -1060,6 +1154,7 @@ def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> lis
     return rows
 
 
+@cached
 def stats_by_type(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
@@ -1080,6 +1175,7 @@ def stats_by_type(year: Optional[int] = None, db_path: DbTarget = None) -> list[
     return rows
 
 
+@cached
 def stats_by_event(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
@@ -1099,6 +1195,7 @@ def stats_by_event(year: Optional[int] = None, db_path: DbTarget = None) -> list
     return rows
 
 
+@cached
 def stats_articles_by_indexing(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     """Статьи по индексации: [{'indexing', 'articles', 'authors'}] (без индексации → 'не указана')."""
     cond, params = _event_filter(year)
@@ -1121,6 +1218,7 @@ def stats_articles_by_indexing(year: Optional[int] = None, db_path: DbTarget = N
     return sorted(out, key=lambda r: order.get(r["indexing"], len(order)))
 
 
+@cached
 def count_events(year: Optional[int] = None, db_path: DbTarget = None) -> int:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
@@ -1130,6 +1228,7 @@ def count_events(year: Optional[int] = None, db_path: DbTarget = None) -> int:
         ).scalar_one())
 
 
+@cached
 def count_participations(year: Optional[int] = None, db_path: DbTarget = None) -> int:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
@@ -1139,6 +1238,7 @@ def count_participations(year: Optional[int] = None, db_path: DbTarget = None) -
         ), params).scalar_one())
 
 
+@cached
 def participations_by_month(year: Optional[int] = None, db_path: DbTarget = None) -> list[int]:
     """12 counts (Jan..Dec). Month grouping is done in Python → portable."""
     cond, params = _event_filter(year)
@@ -1156,6 +1256,7 @@ def participations_by_month(year: Optional[int] = None, db_path: DbTarget = None
     return counts
 
 
+@cached
 def user_year_summary(user_id: int, year: int, db_path: DbTarget = None) -> dict:
     """{'total': N, 'грант': x, 'конференция': y, 'конкурс': z} for one member and year."""
     cond, params = _event_filter(year)
@@ -1171,6 +1272,7 @@ def user_year_summary(user_id: int, year: int, db_path: DbTarget = None) -> dict
     return out
 
 
+@cached
 def available_years(db_path: DbTarget = None) -> list[int]:
     """Years that have events or meetings (desc)."""
     years: set[int] = set()
@@ -1309,12 +1411,14 @@ def delete_meeting(meeting_id: int, db_path: DbTarget = None) -> bool:
         return res.rowcount > 0
 
 
+@cached
 def get_meeting(meeting_id: int, db_path: DbTarget = None) -> Optional[dict]:
     with get_engine(db_path).connect() as conn:
         r = _one(conn.execute(text("SELECT * FROM meetings WHERE id = :id"), {"id": meeting_id}))
     return _meeting_row(r) if r else None
 
 
+@cached
 def list_meetings(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     """Meetings sorted by date/time; each row gets 'number' = 1..N within the list."""
     df, dt = year_range(year)
@@ -1331,6 +1435,7 @@ def list_meetings(year: Optional[int] = None, db_path: DbTarget = None) -> list[
     return rows
 
 
+@cached
 def count_meetings(
     year: Optional[int] = None,
     kind: Optional[str] = None,
@@ -1348,6 +1453,7 @@ def count_meetings(
 EVENT_TYPE_TO_KIND = {"конференция": "Конференция"}
 
 
+@cached
 def unlinked_member_events(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
     """Member events (deduplicated by the events table) with ≥1 achievement in the year
     that are not linked to any meeting yet. Suggested kind/topic/format included."""
@@ -1377,6 +1483,7 @@ def unlinked_member_events(year: Optional[int] = None, db_path: DbTarget = None)
     return rows
 
 
+@cached
 def recent_locations(limit: int = 10, db_path: DbTarget = None) -> list[str]:
     """Distinct locations, most recently used first."""
     with get_engine(db_path).connect() as conn:
@@ -1396,9 +1503,14 @@ def recent_locations(limit: int = 10, db_path: DbTarget = None) -> list[str]:
 # ── App settings (key/value) ────────────────────────────────────────────────
 
 
-def get_app_setting(key: str, default: Optional[str] = None, db_path: DbTarget = None) -> Optional[str]:
+@cached
+def _settings_map(db_path: DbTarget = None) -> dict:
     with get_engine(db_path).connect() as conn:
-        v = conn.execute(text("SELECT value FROM settings WHERE key = :k"), {"k": key}).scalar()
+        return {k: v for k, v in conn.execute(text("SELECT key, value FROM settings"))}
+
+
+def get_app_setting(key: str, default: Optional[str] = None, db_path: DbTarget = None) -> Optional[str]:
+    v = _settings_map(db_path).get(key)
     return default if v is None else v
 
 
@@ -1426,6 +1538,7 @@ def _clean_signatories(items: Any) -> list[dict]:
     return out
 
 
+@cached
 def get_report_settings(db_path: DbTarget = None) -> dict:
     raw = get_app_setting("signatories", None, db_path=db_path)
     if raw is None:

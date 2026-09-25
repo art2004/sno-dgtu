@@ -372,10 +372,47 @@ def run_migration(target) -> None:  # noqa: ANN001
           f"+ {n_people} co-author; legacy md5 unchanged; idempotent; warnings={len(data['warnings'])})")
 
 
+def run_cache(target) -> None:  # noqa: ANN001
+    """Read cache: hits skip SQL, any write (any code path) invalidates, copies are isolated."""
+    from sqlalchemy import event
+    eng = db.get_engine(target)
+    n = {"q": 0}
+
+    def _count(*_a, **_k):  # noqa: ANN002, ANN003
+        n["q"] += 1
+    event.listen(eng, "before_cursor_execute", _count)
+    try:
+        users = db.list_users(db_path=target)
+        n["q"] = 0
+        again = db.list_users(db_path=target)
+        assert n["q"] == 0 and again == users  # served from cache
+        again[0]["full_name"] = "ИЗМЕНЕНО"  # caller mutation must not leak into the cache
+        assert db.list_users(db_path=target)[0]["full_name"] != "ИЗМЕНЕНО"
+        uid = db.create_user("cache_probe", "pass12345", "Кэш Проба", "member", db_path=target)
+        assert any(u["id"] == uid for u in db.list_users(db_path=target))  # visible immediately
+        db.set_app_setting("sno_name", "Кэш-тест", db_path=target)
+        assert db.get_report_settings(db_path=target)["sno_name"] == "Кэш-тест"
+        k = ach.list_kinds(target, admin=True)[0]
+        ach.rename_kind(k["id"], k["label"] + " *", bool(k["hidden"]), db_path=target)
+        assert ach.list_kinds(target, admin=True)[0]["label"] == k["label"] + " *"
+        ach.rename_kind(k["id"], k["label"], bool(k["hidden"]), db_path=target)
+        db.set_app_setting("sno_name", "Сельское хозяйство", db_path=target)
+        db.delete_user(uid, db_path=target)
+        assert not any(u["id"] == uid for u in db.list_users(db_path=target))
+        ach.catalog(target)
+        n["q"] = 0
+        ach.catalog(target)
+        assert n["q"] == 0  # cached until the next write
+    finally:
+        event.remove(eng, "before_cursor_execute", _count)
+    print("  read cache: hits, isolation, invalidation on writes OK")
+
+
 def run_all(target, fresh) -> None:  # noqa: ANN001
     """target: DB for catalog/fixture tests (fresh); fresh(): returns a new empty DB target."""
     db.init_db(db_path=target, seed_admin=True)
     run_catalog(target)
+    run_cache(target)
     run_numbers_and_validation(target)
     run_orphans_and_meetings(target)
     run_fixtures_report(target)
