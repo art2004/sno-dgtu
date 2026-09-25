@@ -31,8 +31,13 @@ def _engine():
     return db.get_engine()
 
 
+# Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
+# push without restarting the process, so a cached init would never re-run.
+SCHEMA_VERSION = "2026-09-25-annual"
+
+
 @st.cache_resource(show_spinner="Подключение к базе данных…")
-def _init_schema() -> bool:
+def _init_schema(version: str = SCHEMA_VERSION) -> bool:
     """Create tables once per server process (not on every rerun).
 
     init_db retries 3 times with a 2 s backoff: Neon free tier may need a few
@@ -45,7 +50,7 @@ def _init_schema() -> bool:
 
 
 try:
-    _init_schema()
+    _init_schema(SCHEMA_VERSION)
 except Exception as exc:  # noqa: BLE001
     st.error(
         "Не удалось подключиться к базе данных. Проверьте DATABASE_URL "
