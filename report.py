@@ -148,15 +148,16 @@ def build_year_xlsx(participations: list[dict], meetings: Optional[list[dict]] =
                 "Мероприятие": r["title"],
                 "Тип": r["type"],
                 "Дата": str(r["event_date"]),
-                "Номер достижения": r.get("achievement_number") or "",
+                "Номер в портфолио": r.get("achievement_number") or "",
+                "Есть номер": "да" if r.get("achievement_number") else "нет",
                 "Тема статьи": r.get("article_topic") or "",
                 "Индексация": r.get("indexing") or "",
                 "Добавлено": str(r["joined_at"])[:19],
             }
             for r in participations
         ],
-        columns=["ФИО", "Логин", "Мероприятие", "Тип", "Дата", "Номер достижения",
-                 "Тема статьи", "Индексация", "Добавлено"],
+        columns=["ФИО", "Логин", "Мероприятие", "Тип", "Дата", "Номер в портфолио",
+                 "Есть номер", "Тема статьи", "Индексация", "Добавлено"],
     )
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:

@@ -326,6 +326,9 @@ def _migrate_schema(eng: Engine) -> None:
             if col not in existing[table]:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
 
+    # 3) One-time (idempotent) cleanup: events left with 0 participations by older versions.
+    delete_orphan_events(db_path=eng)
+
 
 def init_db(
     db_path: DbTarget = None,
@@ -462,17 +465,59 @@ def list_users(
         return _rows(conn.execute(text(sql), params))
 
 
+class AdminGuardError(ValueError):
+    """Change refused to keep at least one active admin (message in Russian)."""
+
+
+def _check_admin_guard(conn, user_id: int, acting_user_id: Optional[int],  # noqa: ANN001
+                       new_role: Optional[str], new_active: Optional[bool],
+                       deleting: bool = False) -> None:
+    row = conn.execute(
+        text("SELECT role, active FROM users WHERE id = :id"), {"id": user_id}
+    ).first()
+    if row is None:
+        return
+    was_active_admin = row[0] == "admin" and bool(row[1])
+    demote = new_role is not None and new_role != "admin" and row[0] == "admin"
+    disable = new_active is not None and not new_active and bool(row[1])
+    if acting_user_id is not None and int(acting_user_id) == int(user_id):
+        if deleting:
+            raise AdminGuardError("Нельзя удалить себя.")
+        if demote:
+            raise AdminGuardError("Нельзя снять роль админа с самого себя.")
+        if disable:
+            raise AdminGuardError("Нельзя отключить свою учётную запись.")
+    if was_active_admin and (deleting or demote or disable):
+        if conn.dialect.name == "postgresql":
+            # serialize concurrent "demote each other" attempts
+            conn.execute(text("SELECT id FROM users WHERE role = 'admin' AND active = 1 FOR UPDATE"))
+        others = conn.execute(
+            text("SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1 AND id <> :id"),
+            {"id": user_id},
+        ).scalar_one()
+        if int(others) == 0:
+            raise AdminGuardError(
+                "Это последний активный админ: его нельзя разжаловать, отключить или удалить. "
+                "Сначала назначьте админом другого участника."
+            )
+
+
 def update_user(
     user_id: int,
     full_name: Optional[str] = None,
     login: Optional[str] = None,
     password: Optional[str] = None,
     active: Optional[bool] = None,
+    role: Optional[str] = None,
+    acting_user_id: Optional[int] = None,
     db_path: DbTarget = None,
 ) -> None:
-    """Raises DuplicateError if the new login is taken."""
+    """Raises DuplicateError if the new login is taken, AdminGuardError if the change
+    would demote yourself or leave no active admin."""
     from auth import hash_password
 
+    if role is not None and role not in ("admin", "member"):
+        raise ValueError(f"Недопустимая роль: {role}")
     fields: list[str] = []
     params: dict[str, Any] = {"id": user_id}
     if full_name is not None:
@@ -487,15 +532,24 @@ def update_user(
     if active is not None:
         fields.append("active = :active")
         params["active"] = 1 if active else 0
+    if role is not None:
+        fields.append("role = :role")
+        params["role"] = role
     if not fields:
         return
     with get_engine(db_path).begin() as conn:
+        _check_admin_guard(conn, user_id, acting_user_id, role, active)
         conn.execute(text(f"UPDATE users SET {', '.join(fields)} WHERE id = :id"), params)
 
 
-def delete_user(user_id: int, db_path: DbTarget = None) -> None:
+def delete_user(user_id: int, acting_user_id: Optional[int] = None,
+                db_path: DbTarget = None) -> None:
+    """Delete user (participations cascade) and events left without participants.
+    Raises AdminGuardError for yourself or the last active admin."""
     with get_engine(db_path).begin() as conn:
+        _check_admin_guard(conn, user_id, acting_user_id, None, None, deleting=True)
         conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": user_id})
+        _delete_orphans(conn)
 
 
 # ── Events & participations ─────────────────────────────────────────────────
@@ -593,6 +647,7 @@ def import_members(rows: list[dict], db_path: DbTarget = None) -> tuple[int, int
         except DuplicateError:  # created concurrently
             skipped += 1
     return created, skipped
+
 
 def normalize_achievement(value: Optional[str]) -> Optional[str]:
     """Номер достижения: обычная строка, strip, не длиннее 64 символов; пусто → NULL."""
@@ -708,15 +763,32 @@ def add_participation_ex(
     ev = get_or_create_event_ex(
         title, event_type, event_date, article_topic, indexing, db_path=db_path
     )
+    try:
+        pid = _insert_participation(user_id, ev["event_id"], ach, db_path)
+    except IntegrityError:
+        # The event may have just been removed as an orphan by another session → retry once.
+        with get_engine(db_path).connect() as conn:
+            alive = conn.execute(text("SELECT 1 FROM events WHERE id = :e"),
+                                 {"e": ev["event_id"]}).first()
+        if alive:
+            raise
+        ev = get_or_create_event_ex(
+            title, event_type, event_date, article_topic, indexing, db_path=db_path
+        )
+        pid = _insert_participation(user_id, ev["event_id"], ach, db_path)
+    return {"participation_id": pid, "event_id": ev["event_id"],
+            "indexing_conflict": ev["indexing_conflict"]}
+
+
+def _insert_participation(user_id: int, event_id: int, ach: Optional[str],
+                          db_path: DbTarget) -> int:
     with get_engine(db_path).begin() as conn:
-        pid = _insert_returning_id(
+        return _insert_returning_id(
             conn,
             "INSERT INTO participations (user_id, event_id, created_at, achievement_number) "
             "VALUES (:u, :e, :now, :ach)",
-            {"u": user_id, "e": ev["event_id"], "now": _now(), "ach": ach},
+            {"u": user_id, "e": event_id, "now": _now(), "ach": ach},
         )
-    return {"participation_id": pid, "event_id": ev["event_id"],
-            "indexing_conflict": ev["indexing_conflict"]}
 
 
 def add_participation(
@@ -756,8 +828,12 @@ def delete_participation(
     user_id: Optional[int] = None,
     db_path: DbTarget = None,
 ) -> bool:
-    """Delete participation. If user_id given, only that user's row. Returns True if deleted."""
+    """Delete participation. If user_id given, only that user's row. Returns True if deleted.
+    The event is deleted too when this was its last participation."""
     with get_engine(db_path).begin() as conn:
+        eid = conn.execute(
+            text("SELECT event_id FROM participations WHERE id = :id"), {"id": participation_id}
+        ).scalar()
         if user_id is not None:
             res = conn.execute(
                 text("DELETE FROM participations WHERE id = :id AND user_id = :u"),
@@ -767,7 +843,106 @@ def delete_participation(
             res = conn.execute(
                 text("DELETE FROM participations WHERE id = :id"), {"id": participation_id}
             )
+        if res.rowcount > 0 and eid is not None:
+            _delete_orphans(conn, [int(eid)])
         return res.rowcount > 0
+
+
+def _delete_orphans(conn, event_ids: Optional[list[int]] = None) -> int:  # noqa: ANN001
+    """Delete events without participations (all, or only among event_ids).
+    Linked meetings stay in the report: their event_id is cleared first (same as the
+    FK's ON DELETE SET NULL, done explicitly so it never depends on FK support)."""
+    cond = "NOT EXISTS (SELECT 1 FROM participations p WHERE p.event_id = events.id)"
+    params: dict[str, Any] = {}
+    if event_ids is not None:
+        if not event_ids:
+            return 0
+        names = [f"e{i}" for i in range(len(event_ids))]
+        cond += " AND id IN (" + ", ".join(":" + n for n in names) + ")"
+        params = dict(zip(names, event_ids))
+    orphan_sel = f"SELECT id FROM events WHERE {cond}"
+    conn.execute(text(f"UPDATE meetings SET event_id = NULL WHERE event_id IN ({orphan_sel})"), params)
+    return conn.execute(text(f"DELETE FROM events WHERE {cond}"), params).rowcount
+
+
+def delete_orphan_events(db_path: DbTarget = None) -> int:  # also accepts an Engine
+    """Delete all events with 0 participations; returns how many were removed."""
+    eng = db_path if isinstance(db_path, Engine) else get_engine(db_path)
+    with eng.begin() as conn:
+        return _delete_orphans(conn)
+
+
+def update_event(
+    event_id: int,
+    title: str,
+    event_type: str,
+    event_date: str | date,
+    article_topic: Optional[str] = None,
+    indexing: Optional[str] = None,
+    db_path: DbTarget = None,
+) -> dict:
+    """Admin edit of a shared event (affects all co-participants).
+
+    If the new title/type/date equals another existing event, the two are merged:
+    participations move to that event (a member already in it keeps one row, the
+    achievement number is kept if the remaining row had none) and this event is
+    removed. Returns {'event_id', 'merged'}.
+    """
+    if event_type not in EVENT_TYPES:
+        raise ValueError(f"Недопустимый тип: {event_type}")
+    title = (title or "").strip()
+    title_norm = normalize_title(title)
+    if not title_norm:
+        raise ValueError("Название мероприятия пустое")
+    topic, idx = _event_extras(event_type, article_topic, indexing)
+    d = _to_date(event_date).isoformat()
+    with get_engine(db_path).begin() as conn:
+        target = conn.execute(
+            text("SELECT id FROM events WHERE title_norm = :tn AND type = :t "
+                 "AND event_date = :d AND id <> :id"),
+            {"tn": title_norm, "t": event_type, "d": d, "id": event_id},
+        ).scalar()
+        if target is None:
+            res = conn.execute(
+                text("UPDATE events SET title = :title, title_norm = :tn, type = :t, "
+                     "event_date = :d, article_topic = :topic, indexing = :idx WHERE id = :id"),
+                {"title": title, "tn": title_norm, "t": event_type, "d": d,
+                 "topic": topic, "idx": idx, "id": event_id},
+            )
+            if res.rowcount == 0:
+                raise ValueError("Мероприятие не найдено (возможно, уже удалено).")
+            return {"event_id": event_id, "merged": False}
+        target = int(target)
+        # members already in the target: keep their row, copy a missing number over
+        conn.execute(text(
+            "UPDATE participations SET achievement_number = ("
+            "  SELECT o.achievement_number FROM participations o"
+            "  WHERE o.event_id = :src AND o.user_id = participations.user_id) "
+            "WHERE event_id = :dst AND (achievement_number IS NULL OR achievement_number = '') "
+            "AND user_id IN (SELECT user_id FROM participations WHERE event_id = :src)"
+        ), {"src": event_id, "dst": target})
+        conn.execute(text(
+            "DELETE FROM participations WHERE event_id = :src "
+            "AND user_id IN (SELECT user_id FROM participations WHERE event_id = :dst)"
+        ), {"src": event_id, "dst": target})
+        conn.execute(text("UPDATE participations SET event_id = :dst WHERE event_id = :src"),
+                     {"src": event_id, "dst": target})
+        conn.execute(text("UPDATE meetings SET event_id = :dst WHERE event_id = :src"),
+                     {"src": event_id, "dst": target})
+        if topic or idx:
+            conn.execute(text(
+                "UPDATE events SET article_topic = COALESCE(article_topic, :topic), "
+                "indexing = COALESCE(indexing, :idx) WHERE id = :dst"
+            ), {"topic": topic, "idx": idx, "dst": target})
+        conn.execute(text("DELETE FROM events WHERE id = :src"), {"src": event_id})
+        return {"event_id": target, "merged": True}
+
+
+def event_participants_count(event_id: int, db_path: DbTarget = None) -> int:
+    with get_engine(db_path).connect() as conn:
+        return int(conn.execute(
+            text("SELECT COUNT(*) FROM participations WHERE event_id = :e"), {"e": event_id}
+        ).scalar_one())
 
 
 def list_participations_for_user(user_id: int, db_path: DbTarget = None) -> list[dict]:
@@ -857,10 +1032,11 @@ def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> lis
                    SUM(CASE WHEN x.type = 'конференция' THEN 1 ELSE 0 END) AS conferences,
                    SUM(CASE WHEN x.type = 'конкурс' THEN 1 ELSE 0 END) AS contests,
                    SUM(CASE WHEN x.type = 'стипендия' THEN 1 ELSE 0 END) AS scholarships,
-                   SUM(CASE WHEN x.type = 'статья' THEN 1 ELSE 0 END) AS articles
+                   SUM(CASE WHEN x.type = 'статья' THEN 1 ELSE 0 END) AS articles,
+                   SUM(CASE WHEN x.ach IS NOT NULL AND x.ach <> '' THEN 1 ELSE 0 END) AS with_number
             FROM users u
             LEFT JOIN (
-                SELECT p.id AS pid, p.user_id, e.type
+                SELECT p.id AS pid, p.user_id, e.type, p.achievement_number AS ach
                 FROM participations p
                 JOIN events e ON e.id = p.event_id
                 WHERE 1=1 {cond}
@@ -871,7 +1047,8 @@ def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> lis
             """
         ), params))
     for r in rows:  # Postgres SUM → bigint/None; normalize to int
-        for k in ("total", "grants", "conferences", "contests", "scholarships", "articles"):
+        for k in ("total", "grants", "conferences", "contests", "scholarships", "articles",
+                  "with_number"):
             r[k] = int(r[k] or 0)
     return rows
 
@@ -884,7 +1061,7 @@ def stats_by_type(year: Optional[int] = None, db_path: DbTarget = None) -> list[
             SELECT e.type, COUNT(DISTINCT e.id) AS events_count,
                    COUNT(p.id) AS participations_count
             FROM events e
-            LEFT JOIN participations p ON p.event_id = e.id
+            JOIN participations p ON p.event_id = e.id
             WHERE 1=1 {cond}
             GROUP BY e.type
             ORDER BY e.type
@@ -904,7 +1081,7 @@ def stats_by_event(year: Optional[int] = None, db_path: DbTarget = None) -> list
             SELECT e.id AS event_id, e.title, e.type, e.event_date,
                    COUNT(p.id) AS participants_count
             FROM events e
-            LEFT JOIN participations p ON p.event_id = e.id
+            JOIN participations p ON p.event_id = e.id
             WHERE 1=1 {cond}
             GROUP BY e.id, e.title, e.type, e.event_date
             ORDER BY e.event_date DESC, COUNT(p.id) DESC
@@ -923,7 +1100,7 @@ def stats_articles_by_indexing(year: Optional[int] = None, db_path: DbTarget = N
             f"""
             SELECT e.indexing, COUNT(DISTINCT e.id) AS articles, COUNT(p.id) AS authors
             FROM events e
-            LEFT JOIN participations p ON p.event_id = e.id
+            JOIN participations p ON p.event_id = e.id
             WHERE e.type = 'статья' {cond}
             GROUP BY e.indexing
             """
@@ -941,7 +1118,8 @@ def count_events(year: Optional[int] = None, db_path: DbTarget = None) -> int:
     cond, params = _event_filter(year)
     with get_engine(db_path).connect() as conn:
         return int(conn.execute(
-            text(f"SELECT COUNT(*) FROM events e WHERE 1=1 {cond}"), params
+            text(f"SELECT COUNT(*) FROM events e WHERE EXISTS "
+                 f"(SELECT 1 FROM participations p WHERE p.event_id = e.id) {cond}"), params
         ).scalar_one())
 
 

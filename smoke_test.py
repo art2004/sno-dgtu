@@ -1,7 +1,8 @@
 """Smoke-test: admin seed, member create, event add, dedup, cascade, password change,
 meetings CRUD, report settings, .docx/.xlsx report generation, year-filtered stats,
 signed «remember me» cookie tokens (expiry, tamper, password change, deletion),
-members import from Excel.
+members import from Excel, orphan events cleanup, admin edit of shared events,
+portfolio numbers in stats, role changes with last-admin safeguards.
 
 По умолчанию проверяет временную SQLite-базу (рабочая data/sno.db не трогается).
 
@@ -136,6 +137,8 @@ def run(target, expect_admin_password: str) -> None:  # noqa: ANN001
     run_schema_upgrade(target)
     run_auth_cookie(target)
     run_members_import(target)
+    run_orphans_and_admin_edit(target)
+    run_roles(target)
 
     assert db.normalize_title("  Foo   BAR ") == "foo bar"
     assert verify_password("x", hash_password("x"))
@@ -357,9 +360,13 @@ def run_new_types_and_achievements(target) -> None:  # noqa: ANN001
     parts = db.list_all_participations(date_from=df, date_to=dt, db_path=target)
     ws = openpyxl.load_workbook(io.BytesIO(report.build_year_xlsx(parts)))["Участия"]
     header = [c.value for c in ws[1]]
-    assert "Номер достижения" in header and "Индексация" in header, header
-    col = header.index("Номер достижения") + 1
-    assert "ACH-002" in [ws.cell(row=i, column=col).value for i in range(2, ws.max_row + 1)]
+    assert "Номер в портфолио" in header and "Есть номер" in header and "Индексация" in header, header
+    col = header.index("Номер в портфолио") + 1
+    has = header.index("Есть номер") + 1
+    cells = [(ws.cell(row=i, column=col).value, ws.cell(row=i, column=has).value)
+             for i in range(2, ws.max_row + 1)]
+    assert ("ACH-002", "да") in cells, cells
+    assert all((v == "да") == bool(n) for n, v in cells), cells
     print("  new types / articles / achievement numbers OK")
 
 
@@ -595,6 +602,140 @@ def run_members_import(target) -> None:  # noqa: ANN001
     for login in ("imp_a", "imp_b", "imp_exist"):
         db.delete_user(db.get_user_by_login(login, db_path=target)["id"], db_path=target)
     print("  members import OK (statuses, create, skip existing, second import, bad file)")
+
+
+def run_orphans_and_admin_edit(target) -> None:  # noqa: ANN001
+    t = target
+    n = lambda: len(db.stats_by_event(db_path=t))  # noqa: E731
+    base_events = n()
+    u1 = db.create_user("orph1", "pass12345", "Орфан Один", db_path=t)
+    u2 = db.create_user("orph2", "pass12345", "Орфан Два", db_path=t)
+    p1e, e_shared = db.add_participation(u1, "Общий грант 2031", "грант", "2031-03-01", db_path=t)
+    p2e, _ = db.add_participation(u2, "Общий грант 2031", "грант", "2031-03-01", db_path=t)
+    p1f, e_solo = db.add_participation(u1, "Одиночный конкурс 2031", "конкурс", "2031-04-01", db_path=t)
+    mid = db.add_meeting("2031-04-02", "13:30", "ауд. 1", "Отчёт о конкурсе", "", kind="Другое",
+                         event_id=e_solo, db_path=t)
+    assert n() == base_events + 2
+    # member deletes the last participation → event gone, linked meeting row kept
+    assert db.delete_participation(p1f, user_id=u1, db_path=t)
+    with db.get_engine(t).connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM events WHERE id = :e"), {"e": e_solo}).scalar() == 0
+    m = db.get_meeting(mid, db_path=t)
+    assert m is not None and m["event_id"] is None and m["topic"] == "Отчёт о конкурсе", m
+    # shared event survives while someone participates; admin delete (no user_id)
+    assert db.delete_participation(p1e, db_path=t)
+    assert db.event_participants_count(e_shared, db_path=t) == 1
+    # user deletion (cascade) removes the now-empty event
+    db.delete_user(u2, db_path=t)
+    with db.get_engine(t).connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM events WHERE id = :e"), {"e": e_shared}).scalar() == 0
+    assert n() == base_events
+    # old DB: orphan events (one linked to a meeting) → hidden in stats, removed by init_db
+    with db.get_engine(t).begin() as c:
+        for i in range(2):
+            c.execute(text("INSERT INTO events (title, title_norm, type, event_date, created_at) "
+                           "VALUES (:t, :t, 'грант', '2031-05-0' || :i, 'x')"), {"t": f"сирота {i}", "i": str(i + 1)})
+        orphan = c.execute(text("SELECT id FROM events WHERE title = 'сирота 0'")).scalar()
+    mid2 = db.add_meeting("2031-05-03", "13:30", "", "Про сироту", "", event_id=orphan, db_path=t)
+    assert n() == base_events and db.count_events(2031, db_path=t) == 0
+    assert all(r["events_count"] > 0 for r in db.stats_by_type(db_path=t))
+    db.init_db(db_path=t, seed_admin=False)
+    db.init_db(db_path=t, seed_admin=False)  # idempotent
+    with db.get_engine(t).connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM events WHERE title LIKE 'сирота%'")).scalar() == 0
+    assert db.get_meeting(mid2, db_path=t)["event_id"] is None
+    assert db.delete_orphan_events(db_path=t) == 0
+
+    # admin edits: achievement number of another member, event fields, merge
+    a = db.create_user("edit_a", "pass12345", "Редакт А", db_path=t)
+    b = db.create_user("edit_b", "pass12345", "Редакт Б", db_path=t)
+    pa, g = db.add_participation(a, "Грант Икс", "грант", "2032-01-10", db_path=t)
+    pb, _ = db.add_participation(b, "Грант Икс", "грант", "2032-01-10", db_path=t)
+    pa2, h = db.add_participation(a, "Грант Иск (опечатка)", "грант", "2032-01-10", db_path=t)
+    assert not db.set_achievement_number(pa2, "N-1", user_id=b, db_path=t)  # not b's row
+    assert db.set_achievement_number(pa2, "N-1", db_path=t)  # admin: any row
+    res = db.update_event(h, "  грант   икс ", "грант", "2032-01-10", db_path=t)
+    assert res == {"event_id": g, "merged": True}, res
+    rows = db.list_all_participations(user_id=a, db_path=t)
+    assert len(rows) == 1 and rows[0]["event_id"] == g and rows[0]["achievement_number"] == "N-1", rows
+    assert db.event_participants_count(g, db_path=t) == 2
+    # plain edit of a shared event: all co-participants see it; article fields only for статья
+    assert db.update_event(g, "Статья Икс", "статья", "2032-02-01", "Тема", "ВАК", db_path=t) == \
+        {"event_id": g, "merged": False}
+    for uid in (a, b):
+        r = db.list_participations_for_user(uid, db_path=t)[0]
+        assert (r["title"], r["type"], str(r["event_date"]), r["article_topic"], r["indexing"]) == \
+            ("Статья Икс", "статья", "2032-02-01", "Тема", "ВАК"), r
+    db.update_event(g, "Статья Икс", "конкурс", "2032-02-01", "Тема", "ВАК", db_path=t)
+    r = db.list_participations_for_user(a, db_path=t)[0]
+    assert r["article_topic"] is None and r["indexing"] is None
+    for bad in (("", "грант"), ("x", "нет-такого")):
+        try:
+            db.update_event(g, bad[0], bad[1], "2032-02-01", db_path=t)
+            raise AssertionError("ValueError expected")
+        except ValueError:
+            pass
+    # portfolio numbers in per-person stats
+    sp = {r["login"]: r for r in db.stats_by_person(2032, db_path=t)}
+    assert (sp["edit_a"]["with_number"], sp["edit_a"]["total"]) == (1, 1)
+    assert (sp["edit_b"]["with_number"], sp["edit_b"]["total"]) == (0, 1)
+    for uid in (a, b):
+        db.delete_user(uid, db_path=t)
+    assert db.event_participants_count(g, db_path=t) == 0 and n() == base_events
+    print("  orphan events + admin edit/merge + portfolio numbers OK")
+
+
+def run_roles(target) -> None:  # noqa: ANN001
+    t = target
+    admin = db.get_user_by_login(os.environ.get("ADMIN_LOGIN") or "admin", db_path=t)
+    aid = admin["id"]
+    m1 = db.create_user("role_m1", "pass12345", "Роль Один", db_path=t)
+    m2 = db.create_user("role_m2", "pass12345", "Роль Два", db_path=t)
+
+    def refused(fn, *args, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
+        try:
+            fn(*args, **kw)
+        except db.AdminGuardError as e:
+            return str(e)
+        raise AssertionError(f"AdminGuardError expected: {fn.__name__} {args} {kw}")
+
+    def role(uid):  # noqa: ANN001, ANN202
+        return db.get_user_by_id(uid, db_path=t)["role"]
+
+    # only admin: cannot demote/disable/delete self, nor be demoted by "system"
+    assert "самого себя" in refused(db.update_user, aid, role="member", acting_user_id=aid, db_path=t)
+    refused(db.update_user, aid, active=False, acting_user_id=aid, db_path=t)
+    refused(db.delete_user, aid, acting_user_id=aid, db_path=t)
+    assert "последний" in refused(db.update_user, aid, role="member", db_path=t)
+    refused(db.update_user, aid, active=False, db_path=t)
+    refused(db.delete_user, aid, db_path=t)
+    # an inactive second admin does not count
+    db.update_user(m2, role="admin", active=False, acting_user_id=aid, db_path=t)
+    assert "последний" in refused(db.update_user, aid, role="member", db_path=t)
+    db.update_user(m2, role="member", active=True, acting_user_id=aid, db_path=t)
+    # promote m1 → m1 demotes the original admin → m1 is now the last admin
+    db.update_user(m1, role="admin", acting_user_id=aid, db_path=t)
+    assert role(m1) == "admin"
+    db.update_user(aid, role="member", acting_user_id=m1, db_path=t)
+    assert role(aid) == "member"
+    # ensure_admin (ADMIN_LOGIN secret) does not undo the manual demotion while an admin exists
+    assert db.ensure_admin(t) == "exists" and role(aid) == "member"
+    refused(db.update_user, m1, role="member", acting_user_id=m1, db_path=t)
+    refused(db.update_user, m1, role="member", acting_user_id=aid, db_path=t)  # last admin
+    refused(db.update_user, m1, active=False, acting_user_id=aid, db_path=t)
+    refused(db.delete_user, m1, acting_user_id=aid, db_path=t)
+    try:
+        db.update_user(m1, role="superuser", db_path=t)
+        raise AssertionError("ValueError expected")
+    except ValueError:
+        pass
+    # restore: original admin back, m1 demoted, members deleted
+    db.update_user(aid, role="admin", acting_user_id=m1, db_path=t)
+    db.update_user(m1, role="member", acting_user_id=aid, db_path=t)
+    assert role(aid) == "admin" and role(m1) == "member"
+    for uid in (m1, m2):
+        db.delete_user(uid, acting_user_id=aid, db_path=t)
+    print("  roles OK (promote/demote, self-demote refused, last active admin protected, ensure_admin)")
 
 
 def main() -> None:

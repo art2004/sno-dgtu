@@ -72,6 +72,16 @@ def _ensure_session() -> None:
         user = auth.user_from_token(st.context.cookies.get(auth.COOKIE_NAME))
         if user is not None:
             st.session_state.user = _session_user(user)
+    elif st.session_state.user is not None:
+        # Role/name/login changed by an admin take effect on the next rerun;
+        # a deleted or disabled account is logged out.
+        fresh = db.get_user_by_id(st.session_state.user["id"])
+        if fresh is None or not fresh.get("active"):
+            st.session_state.user = None
+            st.session_state["_cookie_logged_out"] = True
+            _queue_auth_cookie(None)
+        else:
+            st.session_state.user = _session_user(fresh)
 
 
 def _queue_auth_cookie(user_id: int | None) -> None:
@@ -173,41 +183,81 @@ TYPE_LABELS = {
     "стипендия": "стипендия",
     "статья": "статья",
 }
-_P_DEFAULTS = {"p_title": "", "p_topic": "", "p_ach": ""}
+_P_FIELDS = {"title": "", "topic": "", "ach": ""}
 
 
-def _add_participation_cb(user_id: int) -> None:
-    """on_click callback: runs before the rerun, so it may reset the input widgets."""
+def _add_participation_cb(user_id: int | None, pfx: str = "p_") -> None:
+    """on_click callback: runs before the rerun, so it may reset the input widgets.
+    user_id None → admin form: the member is taken from the «<pfx>user» selectbox."""
     ss = st.session_state
-    etype = ss.get("p_type", db.EVENT_TYPES[0])
-    title = (ss.get("p_title") or "").strip()
+    on_behalf = user_id is None
+    if on_behalf:
+        user_id = ss.get(f"{pfx}user")
+        if not user_id:
+            ss[f"{pfx}msg"] = ("error", "Выберите участника.")
+            return
+    etype = ss.get(f"{pfx}type", db.EVENT_TYPES[0])
+    title = (ss.get(f"{pfx}title") or "").strip()
     is_article = etype == db.ARTICLE_TYPE
     if not title:
-        ss["p_msg"] = ("error", "Укажите название статьи." if is_article else "Укажите название мероприятия.")
+        ss[f"{pfx}msg"] = ("error", "Укажите название статьи." if is_article else "Укажите название мероприятия.")
         return
     try:
         res = db.add_participation_ex(
             user_id,
             title,
             etype,
-            ss.get("p_date") or date.today(),
-            article_topic=ss.get("p_topic") if is_article else None,
-            indexing=ss.get("p_indexing") if is_article else None,
-            achievement_number=ss.get("p_ach"),
+            ss.get(f"{pfx}date") or date.today(),
+            article_topic=ss.get(f"{pfx}topic") if is_article else None,
+            indexing=ss.get(f"{pfx}indexing") if is_article else None,
+            achievement_number=ss.get(f"{pfx}ach"),
         )
     except db.DuplicateError:
-        ss["p_msg"] = ("warning", "Вы уже зарегистрированы на это мероприятие "
-                                  "(одинаковые название, тип и дата).")
+        ss[f"{pfx}msg"] = ("warning", ("Участник уже зарегистрирован" if on_behalf else "Вы уже зарегистрированы")
+                           + " на это мероприятие (одинаковые название, тип и дата).")
         return
     except ValueError as e:
-        ss["p_msg"] = ("error", str(e))
+        ss[f"{pfx}msg"] = ("error", str(e))
         return
     msgs = [("success", "Статья добавлена." if is_article else "Участие добавлено.")]
     if res["indexing_conflict"]:
         msgs.append(("info", f"Эта статья уже добавлена соавтором с индексацией "
                              f"«{res['indexing_conflict']}» — оставлена она."))
-    ss["p_msg"] = msgs
-    ss.update(_P_DEFAULTS)
+    ss[f"{pfx}msg"] = msgs
+    ss.update({f"{pfx}{k}": v for k, v in _P_FIELDS.items()})
+
+
+def _participation_form(user_id: int | None, pfx: str = "p_") -> None:
+    """Add-participation inputs (no st.form: article fields appear as soon as «статья»
+    is chosen). Used by members (pfx p_) and by admins on behalf of a member (ap_)."""
+    for k, v in _P_FIELDS.items():
+        st.session_state.setdefault(f"{pfx}{k}", v)
+    st.session_state.setdefault(f"{pfx}date", date.today())
+    col1, col2 = st.columns(2)
+    with col1:
+        event_type = st.selectbox(
+            "Тип мероприятия", db.EVENT_TYPES, key=f"{pfx}type",
+            format_func=lambda t: TYPE_LABELS.get(t, t),
+        )
+        st.date_input("Дата", key=f"{pfx}date", format="DD.MM.YYYY")
+    is_article = event_type == db.ARTICLE_TYPE
+    with col2:
+        st.text_input(
+            "Название статьи" if is_article else "Название",
+            key=f"{pfx}title",
+            placeholder="Название статьи" if is_article else "Например: УМНИК 2026",
+        )
+        if is_article:
+            st.text_input("Тема статьи", key=f"{pfx}topic")
+            st.selectbox("Индексация", db.INDEXING_OPTIONS, key=f"{pfx}indexing")
+    st.text_input(
+        "Номер достижения (с сайта вуза, необязательно)",
+        key=f"{pfx}ach",
+        max_chars=db.ACHIEVEMENT_MAX_LEN,
+    )
+    st.button("Сохранить", type="primary", key=f"{pfx}save",
+              on_click=_add_participation_cb, args=(user_id, pfx))
+    _show_msgs(f"{pfx}msg")
 
 
 def _show_msgs(key: str) -> None:
@@ -230,36 +280,16 @@ def member_cabinet(user: dict) -> None:
         ru_text.member_year_summary(this_year, summary)
     )
 
+    tab_mine, tab_stats = st.tabs(["Мои участия", "Статистика СНО"])
+    with tab_stats:
+        member_stats()
+    with tab_mine:
+        _member_participations(user)
+
+
+def _member_participations(user: dict) -> None:
     with st.expander("➕ Добавить участие", expanded=True):
-        # No st.form here: the article fields must appear as soon as «статья» is chosen.
-        for k, v in _P_DEFAULTS.items():
-            st.session_state.setdefault(k, v)
-        st.session_state.setdefault("p_date", date.today())
-        col1, col2 = st.columns(2)
-        with col1:
-            event_type = st.selectbox(
-                "Тип мероприятия", db.EVENT_TYPES, key="p_type",
-                format_func=lambda t: TYPE_LABELS.get(t, t),
-            )
-            st.date_input("Дата", key="p_date", format="DD.MM.YYYY")
-        is_article = event_type == db.ARTICLE_TYPE
-        with col2:
-            st.text_input(
-                "Название статьи" if is_article else "Название",
-                key="p_title",
-                placeholder="Название статьи" if is_article else "Например: УМНИК 2026",
-            )
-            if is_article:
-                st.text_input("Тема статьи", key="p_topic")
-                st.selectbox("Индексация", db.INDEXING_OPTIONS, key="p_indexing")
-        st.text_input(
-            "Номер достижения (с сайта вуза, необязательно)",
-            key="p_ach",
-            max_chars=db.ACHIEVEMENT_MAX_LEN,
-        )
-        st.button("Сохранить", type="primary", key="p_save",
-                  on_click=_add_participation_cb, args=(user["id"],))
-        _show_msgs("p_msg")
+        _participation_form(user["id"], "p_")
 
     rows = db.list_participations_for_user(user["id"])
     st.subheader(f"Список ({len(rows)})")
@@ -310,7 +340,79 @@ def member_cabinet(user: dict) -> None:
                 st.rerun()
 
 
+def member_stats() -> None:
+    """СНО-wide statistics for members: events only — no names, logins or numbers."""
+    st.subheader("Статистика СНО")
+    choices = _year_choices(include_all=True)
+    year = st.selectbox("Период", choices, index=choices.index(date.today().year),
+                        format_func=_year_label, key="m_stats_year")
+    y = year or None
+    by_event = db.stats_by_event(y)
+    c1, c2 = st.columns(2)
+    c1.metric("Мероприятий", len(by_event))
+    c2.metric("Участий", sum(r["participants_count"] for r in by_event))
+    if not by_event:
+        st.info("За выбранный период мероприятий пока нет.")
+        return
+
+    counts = {t: {"events": 0, "parts": 0} for t in db.EVENT_TYPES}
+    for r in by_event:
+        if r["type"] in counts:
+            counts[r["type"]]["events"] += 1
+            counts[r["type"]]["parts"] += r["participants_count"]
+    df_type = pd.DataFrame(
+        [{"Тип": t, "Мероприятий": c["events"], "Участий": c["parts"]} for t, c in counts.items()]
+    )
+    st.markdown("#### По типам мероприятий")
+    g1, g2 = st.columns([3, 2])
+    with g1:
+        fig = px.bar(df_type, x="Тип", y="Мероприятий", text="Мероприятий")
+        fig.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), xaxis_title=None,
+                          yaxis_title=None, yaxis=dict(fixedrange=True, rangemode="tozero"),
+                          xaxis=dict(fixedrange=True))
+        fig.update_traces(textposition="outside", hovertemplate="%{x}: %{y}<extra></extra>")
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key="m_stats_chart")
+    with g2:
+        st.dataframe(df_type, hide_index=True, width="stretch")
+
+    st.markdown("#### Мероприятия")
+    types = st.multiselect("Тип", db.EVENT_TYPES, key="m_stats_types",
+                           placeholder="Все типы")
+    rows = [r for r in by_event if not types or r["type"] in types]
+    st.dataframe(
+        pd.DataFrame(
+            [{"Название": r["title"], "Тип": r["type"], "Дата": str(r["event_date"]),
+              "Участников": r["participants_count"]} for r in rows],
+            columns=["Название", "Тип", "Дата", "Участников"],
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+
 # ── Admin: members ──────────────────────────────────────────────────────────
+
+
+def _role_label(role: str) -> str:
+    return "Член совета" if role == "member" else "Админ"
+
+
+def _save_user(u: dict, acting: dict, fields: dict) -> None:
+    """update_user with db-level admin safeguards; messages via session_state."""
+    try:
+        db.update_user(u["id"], acting_user_id=acting["id"], **fields)
+    except db.DuplicateError:
+        st.session_state[f"user_msg_{u['id']}"] = ("error", "Логин уже занят.")
+        return
+    except ValueError as e:  # AdminGuardError and validation
+        st.session_state[f"user_msg_{u['id']}"] = ("error", str(e))
+        return
+    if u["id"] == acting["id"] and fields.get("password"):
+        _queue_auth_cookie(acting["id"])  # keep own login
+    msg = "Сохранено."
+    if fields.get("role") and fields["role"] != u["role"]:
+        msg += f" Роль: {_role_label(fields['role']).lower()} (применится при следующем действии пользователя)."
+    st.session_state[f"user_msg_{u['id']}"] = ("success", msg)
 
 
 def admin_members(user: dict) -> None:
@@ -321,9 +423,7 @@ def admin_members(user: dict) -> None:
             full_name = st.text_input("ФИО")
             login = st.text_input("Логин")
             password = st.text_input("Пароль", type="password")
-            role = st.selectbox("Роль", ["member", "admin"], format_func=lambda x: (
-                "Член совета" if x == "member" else "Админ"
-            ))
+            role = st.selectbox("Роль", ["member", "admin"], format_func=_role_label)
             if st.form_submit_button("Создать", type="primary"):
                 if not full_name.strip() or not login.strip() or not password:
                     st.error("Заполните ФИО, логин и пароль.")
@@ -353,6 +453,12 @@ def admin_members(user: dict) -> None:
                     type="password",
                     key=f"pwd_{u['id']}",
                 )
+                new_role = st.selectbox(
+                    "Роль", ["member", "admin"], index=0 if u["role"] == "member" else 1,
+                    format_func=_role_label, key=f"role_{u['id']}",
+                    disabled=u["id"] == user["id"],
+                    help="Свою роль изменить нельзя." if u["id"] == user["id"] else None,
+                )
                 new_active = st.checkbox("Активен", value=bool(u["active"]))
                 col_save, col_del = st.columns(2)
                 save = col_save.form_submit_button("Сохранить")
@@ -362,26 +468,39 @@ def admin_members(user: dict) -> None:
                     if u["id"] == user["id"] and not new_active:
                         st.error("Нельзя отключить свою учётную запись.")
                     else:
-                        try:
-                            db.update_user(
-                                u["id"],
-                                full_name=new_name,
-                                login=new_login,
-                                password=new_password if new_password else None,
-                                active=new_active,
-                            )
-                            if u["id"] == user["id"] and new_password:
-                                _queue_auth_cookie(user["id"])  # keep own login
-                            st.success("Сохранено.")
-                            st.rerun()
-                        except db.DuplicateError:
-                            st.error("Логин уже занят.")
+                        fields = dict(
+                            full_name=new_name,
+                            login=new_login,
+                            password=new_password if new_password else None,
+                            active=new_active,
+                            role=None if u["id"] == user["id"] else new_role,
+                        )
+                        if new_role == "admin" and u["role"] != "admin" and u["id"] != user["id"]:
+                            st.session_state[f"confirm_role_{u['id']}"] = fields  # ask first
+                        else:
+                            _save_user(u, user, fields)
+                        st.rerun()
 
                 if delete:
                     if u["id"] == user["id"]:
                         st.error("Нельзя удалить себя.")
                     else:
                         st.session_state[f"confirm_del_u_{u['id']}"] = True
+
+            _show_msgs(f"user_msg_{u['id']}")
+            role_key = f"confirm_role_{u['id']}"
+            if st.session_state.get(role_key):
+                st.warning(
+                    f"Назначить «{u['full_name']}» админом? Админ видит всех участников, "
+                    "статистику и может менять любые данные."
+                )
+                b1, b2, _ = st.columns([2, 1, 3])
+                if b1.button("Да, назначить админом", key=f"yes_role_{u['id']}", type="primary"):
+                    _save_user(u, user, st.session_state.pop(role_key))
+                    st.rerun()
+                if b2.button("Отмена", key=f"no_role_{u['id']}"):
+                    st.session_state.pop(role_key, None)
+                    st.rerun()
 
             confirm_key = f"confirm_del_u_{u['id']}"
             if st.session_state.get(confirm_key):
@@ -390,8 +509,11 @@ def admin_members(user: dict) -> None:
                 )
                 b1, b2, _ = st.columns([1, 1, 4])
                 if b1.button("Да, удалить", key=f"yes_u_{u['id']}", type="primary"):
-                    db.delete_user(u["id"])
                     st.session_state.pop(confirm_key, None)
+                    try:
+                        db.delete_user(u["id"], acting_user_id=user["id"])
+                    except ValueError as e:  # last active admin / yourself
+                        st.session_state[f"user_msg_{u['id']}"] = ("error", str(e))
                     st.rerun()
                 if b2.button("Отмена", key=f"no_u_{u['id']}"):
                     st.session_state.pop(confirm_key, None)
@@ -510,6 +632,24 @@ def admin_stats() -> None:
 
     with st.expander("Подробнее"):
         _stats_details(by_person, db.stats_by_type(y), db.stats_by_event(y))
+        st.markdown("#### Участия и номера в портфолио")
+        df_, dt_ = db.year_range(y)
+        parts = db.list_all_participations(date_from=df_, date_to=dt_)
+        if parts:
+            st.dataframe(
+                pd.DataFrame([
+                    {"ФИО": r["full_name"], "Мероприятие": r["title"], "Тип": r["type"],
+                     "Дата": str(r["event_date"]),
+                     "Номер в портфолио": r.get("achievement_number") or "",
+                     "Есть номер": bool(r.get("achievement_number"))}
+                    for r in parts
+                ]),
+                width="stretch",
+                hide_index=True,
+                column_config=_NUMBER_COLUMNS,
+            )
+        else:
+            st.caption("За выбранный период участий нет.")
         st.markdown("#### Статьи по индексации")
         by_idx = db.stats_articles_by_indexing(y)
         if by_idx:
@@ -654,6 +794,7 @@ def _stats_details(by_person: list[dict], by_type: list[dict], by_event: list[di
                     "Конкурсы": r["contests"] or 0,
                     "Стипендии": r["scholarships"] or 0,
                     "Статьи": r["articles"] or 0,
+                    "С номером / всего": f"{r['with_number']} / {r['total'] or 0}",
                 }
                 for r in by_person
             ],
@@ -703,6 +844,9 @@ def _stats_details(by_person: list[dict], by_type: list[dict], by_event: list[di
 def admin_all_participations() -> None:
     st.subheader("Все участия")
 
+    with st.expander("➕ Добавить участие за участника"):
+        _admin_add_for_member()
+
     members = db.list_users(active_only=False, role="member")
     member_options = {0: "— все —"}
     member_options.update({m["id"]: f"{m['full_name']} (@{m['login']})" for m in members})
@@ -722,6 +866,7 @@ def admin_all_participations() -> None:
             "Участник",
             options=list(member_options.keys()),
             format_func=lambda x: member_options[x],
+            key="adm_filter_user",
         )
     with f2:
         etype = st.selectbox("Тип", ["— все —", *db.EVENT_TYPES])
@@ -754,32 +899,112 @@ def admin_all_participations() -> None:
         return
 
     st.dataframe(
-        [
-            {
-                "ФИО": r["full_name"],
-                "Логин": r["login"],
-                "Мероприятие": r["title"],
-                "Тип": r["type"],
-                "Дата": r["event_date"],
-                "Номер достижения": r.get("achievement_number") or "",
-                "Индексация": r.get("indexing") or "",
-                "Добавлено": r["joined_at"][:19],
-            }
-            for r in rows
-        ],
+        pd.DataFrame(
+            [
+                {
+                    "ФИО": r["full_name"],
+                    "Логин": r["login"],
+                    "Мероприятие": r["title"],
+                    "Тип": r["type"],
+                    "Дата": str(r["event_date"]),
+                    "Номер в портфолио": r.get("achievement_number") or "",
+                    "Есть номер": bool(r.get("achievement_number")),
+                    "Индексация": r.get("indexing") or "",
+                    "Добавлено": r["joined_at"][:19],
+                }
+                for r in rows
+            ]
+        ),
         width="stretch",
         hide_index=True,
+        column_config=_NUMBER_COLUMNS,
     )
 
-    st.markdown("#### Удаление участия")
+    st.markdown("#### Редактирование и удаление участия")
     ids = {r["participation_id"]: f"{r['full_name']} — {r['title']} ({r['event_date']})" for r in rows}
-    pick = st.selectbox("Выберите запись", options=[0, *ids.keys()], format_func=lambda x: "—" if x == 0 else ids[x])
-    if pick and st.button("Удалить выбранное участие", type="secondary"):
-        st.session_state["confirm_admin_del_p"] = pick
-    if st.session_state.get("confirm_admin_del_p") == pick and pick:
-        st.warning("Подтвердите удаление.")
-        if st.button("Да, удалить", type="primary", key="admin_yes_del"):
-            db.delete_participation(pick)
+    if st.session_state.get("adm_pick") not in (0, *ids):
+        st.session_state["adm_pick"] = 0  # record deleted / filtered out
+    pick = st.selectbox("Выберите запись", options=[0, *ids.keys()],
+                        format_func=lambda x: "—" if x == 0 else ids[x], key="adm_pick")
+    _show_msgs("adm_p_msg")
+    if pick:
+        _admin_edit_participation(next(r for r in rows if r["participation_id"] == pick))
+
+
+_NUMBER_COLUMNS = {
+    "Номер в портфолио": st.column_config.TextColumn("Номер в портфолио"),
+    "Есть номер": st.column_config.CheckboxColumn("Есть номер", disabled=True),
+}
+
+
+def _admin_add_for_member() -> None:
+    users = db.list_users(active_only=True)
+    opts = {u["id"]: f"{u['full_name']} (@{u['login']})" for u in users}
+    if st.session_state.get("ap_user") not in (0, *opts):
+        st.session_state["ap_user"] = 0
+    st.selectbox("Участник", [0, *opts], key="ap_user",
+                 format_func=lambda x: "— выберите участника —" if x == 0 else opts[x])
+    _participation_form(None, "ap_")
+
+
+def _admin_edit_participation(r: dict) -> None:
+    pid, eid = r["participation_id"], r["event_id"]
+    c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+    new_ach = c1.text_input(
+        "Номер в портфолио (номер достижения)", value=r.get("achievement_number") or "",
+        key=f"adm_ach_{pid}", max_chars=db.ACHIEVEMENT_MAX_LEN,
+    )
+    if c2.button("Сохранить номер", key=f"adm_ach_save_{pid}"):
+        try:
+            db.set_achievement_number(pid, new_ach)
+            st.session_state["adm_p_msg"] = ("success", "Номер достижения сохранён.")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
+    n = db.event_participants_count(eid)
+    with st.expander("✏️ Изменить мероприятие (название, тип, дата, тема, индексация)"):
+        if n > 1:
+            st.warning(f"Мероприятие общее для {n} участников — изменения затронут всех. "
+                       "Если такое мероприятие уже есть, записи будут объединены.")
+        with st.form(f"adm_ev_{eid}"):
+            title = st.text_input("Название", value=r["title"])
+            etype = st.selectbox("Тип мероприятия", db.EVENT_TYPES,
+                                 index=db.EVENT_TYPES.index(r["type"]) if r["type"] in db.EVENT_TYPES else 0,
+                                 format_func=lambda t: TYPE_LABELS.get(t, t))
+            ev_date = st.date_input("Дата", value=db._to_date(r["event_date"]), format="DD.MM.YYYY")
+            st.caption("Тема и индексация сохраняются только для типа «статья».")
+            topic = st.text_input("Тема статьи", value=r.get("article_topic") or "")
+            idx_opts = ["", *db.INDEXING_OPTIONS]
+            indexing = st.selectbox(
+                "Индексация", idx_opts,
+                index=idx_opts.index(r["indexing"]) if r.get("indexing") in idx_opts else 0,
+                format_func=lambda x: x or "— не указана —",
+            )
+            if st.form_submit_button("Сохранить мероприятие"):
+                try:
+                    res = db.update_event(eid, title, etype, ev_date, topic, indexing)
+                    st.session_state["adm_p_msg"] = (
+                        "success",
+                        "Мероприятие объединено с уже существующим." if res["merged"]
+                        else "Мероприятие сохранено.",
+                    )
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+    if st.button("🗑 Удалить участие", key=f"adm_del_{pid}"):
+        st.session_state["confirm_admin_del_p"] = pid
+    if st.session_state.get("confirm_admin_del_p") == pid:
+        st.warning(f"Удалить участие «{r['full_name']}» в «{r['title']}»?"
+                   + (" Это последний участник — мероприятие тоже исчезнет." if n <= 1 else ""))
+        b1, b2, _ = st.columns([1, 1, 4])
+        if b1.button("Да, удалить", type="primary", key="admin_yes_del"):
+            db.delete_participation(pid)
+            st.session_state.pop("confirm_admin_del_p", None)
+            st.session_state["adm_p_msg"] = ("success", "Участие удалено.")
+            st.rerun()
+        if b2.button("Отмена", key="admin_no_del"):
             st.session_state.pop("confirm_admin_del_p", None)
             st.rerun()
 
