@@ -10,6 +10,8 @@ import plotly.express as px
 
 import auth
 import db
+import report
+import ru_text
 
 st.set_page_config(
     page_title="СНО ДГТУ — мероприятия",
@@ -20,8 +22,20 @@ st.set_page_config(
 
 
 @st.cache_resource(show_spinner=False)
+def _engine():
+    """One SQLAlchemy engine (connection pool) per server process."""
+    return db.get_engine()
+
+
+@st.cache_resource(show_spinner="Подключение к базе данных…")
 def _init_schema() -> bool:
-    """Create tables once per server process (not on every rerun)."""
+    """Create tables once per server process (not on every rerun).
+
+    init_db retries 3 times with a 2 s backoff: Neon free tier may need a few
+    seconds to wake up. New tables (meetings, settings) are added to existing
+    databases via CREATE TABLE IF NOT EXISTS, existing data is untouched.
+    """
+    _engine()
     db.init_db(seed_admin=False)
     return True
 
@@ -109,62 +123,146 @@ def render_sidebar(user: dict) -> None:
 # ── Member views ────────────────────────────────────────────────────────────
 
 
+TYPE_LABELS = {
+    "грант": "грант",
+    "конференция": "конференция",
+    "конкурс": "конкурс",
+    "стипендия": "стипендия",
+    "статья": "статья",
+}
+_P_DEFAULTS = {"p_title": "", "p_topic": "", "p_ach": ""}
+
+
+def _add_participation_cb(user_id: int) -> None:
+    """on_click callback: runs before the rerun, so it may reset the input widgets."""
+    ss = st.session_state
+    etype = ss.get("p_type", db.EVENT_TYPES[0])
+    title = (ss.get("p_title") or "").strip()
+    is_article = etype == db.ARTICLE_TYPE
+    if not title:
+        ss["p_msg"] = ("error", "Укажите название статьи." if is_article else "Укажите название мероприятия.")
+        return
+    try:
+        res = db.add_participation_ex(
+            user_id,
+            title,
+            etype,
+            ss.get("p_date") or date.today(),
+            article_topic=ss.get("p_topic") if is_article else None,
+            indexing=ss.get("p_indexing") if is_article else None,
+            achievement_number=ss.get("p_ach"),
+        )
+    except db.DuplicateError:
+        ss["p_msg"] = ("warning", "Вы уже зарегистрированы на это мероприятие "
+                                  "(одинаковые название, тип и дата).")
+        return
+    except ValueError as e:
+        ss["p_msg"] = ("error", str(e))
+        return
+    msgs = [("success", "Статья добавлена." if is_article else "Участие добавлено.")]
+    if res["indexing_conflict"]:
+        msgs.append(("info", f"Эта статья уже добавлена соавтором с индексацией "
+                             f"«{res['indexing_conflict']}» — оставлена она."))
+    ss["p_msg"] = msgs
+    ss.update(_P_DEFAULTS)
+
+
+def _show_msgs(key: str) -> None:
+    msgs = st.session_state.pop(key, None)
+    if not msgs:
+        return
+    if isinstance(msgs, tuple):
+        msgs = [msgs]
+    for kind, text_ in msgs:
+        getattr(st, kind)(text_)
+
+
 def member_cabinet(user: dict) -> None:
     st.title("Мои мероприятия")
-    st.caption("Добавляйте участия в гранты, конференции и конкурсы.")
+    st.caption("Добавляйте участия в гранты, конференции, конкурсы, стипендии и статьи.")
+
+    this_year = date.today().year
+    summary = db.user_year_summary(user["id"], this_year)
+    (st.success if summary["total"] else st.info)(
+        ru_text.member_year_summary(this_year, summary)
+    )
 
     with st.expander("➕ Добавить участие", expanded=True):
-        with st.form("add_participation"):
-            col1, col2 = st.columns(2)
-            with col1:
-                event_type = st.selectbox("Тип мероприятия", db.EVENT_TYPES)
-                event_date = st.date_input("Дата", value=date.today())
-            with col2:
-                title = st.text_input("Название", placeholder="Например: УМНИК 2026")
-            submitted = st.form_submit_button("Сохранить", type="primary")
-            if submitted:
-                if not title or not title.strip():
-                    st.error("Укажите название мероприятия.")
-                else:
-                    try:
-                        db.add_participation(
-                            user["id"], title.strip(), event_type, event_date
-                        )
-                        st.success("Участие добавлено.")
-                        st.rerun()
-                    except db.DuplicateError:
-                        st.warning(
-                            "Вы уже зарегистрированы на это мероприятие "
-                            "(одинаковые название, тип и дата)."
-                        )
-                    except ValueError as e:
-                        st.error(str(e))
+        # No st.form here: the article fields must appear as soon as «статья» is chosen.
+        for k, v in _P_DEFAULTS.items():
+            st.session_state.setdefault(k, v)
+        st.session_state.setdefault("p_date", date.today())
+        col1, col2 = st.columns(2)
+        with col1:
+            event_type = st.selectbox(
+                "Тип мероприятия", db.EVENT_TYPES, key="p_type",
+                format_func=lambda t: TYPE_LABELS.get(t, t),
+            )
+            st.date_input("Дата", key="p_date", format="DD.MM.YYYY")
+        is_article = event_type == db.ARTICLE_TYPE
+        with col2:
+            st.text_input(
+                "Название статьи" if is_article else "Название",
+                key="p_title",
+                placeholder="Название статьи" if is_article else "Например: УМНИК 2026",
+            )
+            if is_article:
+                st.text_input("Тема статьи", key="p_topic")
+                st.selectbox("Индексация", db.INDEXING_OPTIONS, key="p_indexing")
+        st.text_input(
+            "Номер достижения (с сайта вуза, необязательно)",
+            key="p_ach",
+            max_chars=db.ACHIEVEMENT_MAX_LEN,
+        )
+        st.button("Сохранить", type="primary", key="p_save",
+                  on_click=_add_participation_cb, args=(user["id"],))
+        _show_msgs("p_msg")
 
     rows = db.list_participations_for_user(user["id"])
     st.subheader(f"Список ({len(rows)})")
+    _show_msgs("ach_msg")
     if not rows:
         st.info("Пока нет участий. Добавьте первое выше.")
         return
 
     for r in rows:
-        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 1])
+        pid = r["participation_id"]
+        c1, c2, c3, c4, c5, c6 = st.columns([4, 2, 2, 2, 1, 1])
         c1.write(r["title"])
+        if r["type"] == db.ARTICLE_TYPE and (r.get("article_topic") or r.get("indexing")):
+            c1.caption(" · ".join(x for x in (r.get("article_topic"), r.get("indexing")) if x))
         c2.write(r["type"])
         c3.write(r["event_date"])
-        c4.caption(f"добавлено {r['joined_at'][:10]}")
+        ach = r.get("achievement_number")
+        c4.caption(f"№ достижения: {ach}" if ach else "без номера достижения")
         with c5:
-            if st.button("🗑", key=f"del_p_{r['participation_id']}", help="Удалить"):
-                st.session_state[f"confirm_del_p_{r['participation_id']}"] = True
+            with st.popover("✏️", help="Номер достижения"):
+                new_ach = st.text_input(
+                    "Номер достижения (с сайта вуза)",
+                    value=ach or "",
+                    key=f"ach_{pid}",
+                    max_chars=db.ACHIEVEMENT_MAX_LEN,
+                )
+                if st.button("Сохранить номер", key=f"ach_save_{pid}"):
+                    try:
+                        db.set_achievement_number(pid, new_ach, user_id=user["id"])
+                        st.session_state["ach_msg"] = ("success", "Номер достижения сохранён.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+        with c6:
+            if st.button("🗑", key=f"del_p_{pid}", help="Удалить"):
+                st.session_state[f"confirm_del_p_{pid}"] = True
 
-        confirm_key = f"confirm_del_p_{r['participation_id']}"
+        confirm_key = f"confirm_del_p_{pid}"
         if st.session_state.get(confirm_key):
             st.warning(f"Удалить участие в «{r['title']}»?")
             b1, b2, _ = st.columns([1, 1, 4])
-            if b1.button("Да, удалить", key=f"yes_p_{r['participation_id']}", type="primary"):
-                db.delete_participation(r["participation_id"], user_id=user["id"])
+            if b1.button("Да, удалить", key=f"yes_p_{pid}", type="primary"):
+                db.delete_participation(pid, user_id=user["id"])
                 st.session_state.pop(confirm_key, None)
                 st.rerun()
-            if b2.button("Отмена", key=f"no_p_{r['participation_id']}"):
+            if b2.button("Отмена", key=f"no_p_{pid}"):
                 st.session_state.pop(confirm_key, None)
                 st.rerun()
 
@@ -254,19 +352,91 @@ def admin_members(user: dict) -> None:
 
 # ── Admin: stats ────────────────────────────────────────────────────────────
 
+ALL_TIME = 0  # sentinel for «За всё время» in year selectors
+
+
+def _year_choices(include_all: bool = False) -> list[int]:
+    years = set(db.available_years())
+    years.add(date.today().year)
+    out = sorted(years, reverse=True)
+    return out + [ALL_TIME] if include_all else out
+
+
+def _year_label(y: int) -> str:
+    return "За всё время" if y == ALL_TIME else str(y)
+
 
 def admin_stats() -> None:
     st.subheader("Статистика")
 
-    by_person = db.stats_by_person()
-    by_type = db.stats_by_type()
-    by_event = db.stats_by_event()
+    choices = _year_choices(include_all=True)
+    year = st.selectbox(
+        "Период",
+        choices,
+        index=choices.index(date.today().year),
+        format_func=_year_label,
+        key="stats_year",
+    )
+    y = year or None  # None → без фильтра
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Активных членов совета", len(by_person))
-    c2.metric("Мероприятий", db.count_events())
-    total_p = sum(int(r["total"] or 0) for r in by_person)
-    c3.metric("Всего участий", total_p)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Участий", db.count_participations(y))
+    c2.metric("Мероприятий", db.count_events(y), help="Мероприятия участников (без дублей)")
+    c3.metric("Заседаний", db.count_meetings(y, kind=db.DEFAULT_MEETING_KIND))
+    c4.metric(
+        "Других мероприятий СНО",
+        db.count_meetings(y, exclude_kind=db.DEFAULT_MEETING_KIND),
+        help="Конференции, форумы, круглые столы и др. из вкладки «Заседания и мероприятия»",
+    )
+
+    st.markdown("#### Участия по месяцам")
+    months = db.participations_by_month(y)
+    df_month = pd.DataFrame({"Месяц": list(ru_text.MONTHS_SHORT), "Участий": months})
+    fig_month = px.bar(df_month, x="Месяц", y="Участий")
+    fig_month.update_layout(
+        height=280,
+        margin=dict(t=10, b=10, l=10, r=10),
+        xaxis_title=None,
+        yaxis_title=None,
+        showlegend=False,
+        xaxis=dict(categoryorder="array", categoryarray=list(ru_text.MONTHS_SHORT), fixedrange=True),
+        yaxis=dict(fixedrange=True, rangemode="tozero", dtick=max(1, (max(months) or 1) // 5)),
+    )
+    fig_month.update_traces(hovertemplate="%{x}: %{y}<extra></extra>")
+    st.plotly_chart(fig_month, width="stretch", config={"displayModeBar": False})
+    if year == ALL_TIME:
+        st.caption("За всё время: участия суммированы по месяцам всех лет.")
+
+    by_person = db.stats_by_person(y)
+    st.markdown("#### Топ-5 активных")
+    top = [r for r in by_person if r["total"] > 0][:5]
+    if top:
+        st.markdown(
+            "\n".join(
+                f"{i}. {r['full_name']} — {ru_text.with_count(r['total'], ru_text.PARTICIPATION_FORMS)}"
+                for i, r in enumerate(top, start=1)
+            )
+        )
+    else:
+        st.caption("За выбранный период участий пока нет.")
+
+    with st.expander("Подробнее"):
+        _stats_details(by_person, db.stats_by_type(y), db.stats_by_event(y))
+        st.markdown("#### Статьи по индексации")
+        by_idx = db.stats_articles_by_indexing(y)
+        if by_idx:
+            st.dataframe(
+                [{"Индексация": r["indexing"], "Статей": r["articles"], "Авторов (участий)": r["authors"]}
+                 for r in by_idx],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("Статей за выбранный период нет.")
+
+
+def _stats_details(by_person: list[dict], by_type: list[dict], by_event: list[dict]) -> None:
+    st.metric("Активных членов совета", len(by_person))
 
     # ── Charts ──────────────────────────────────────────────────────────────
     st.markdown("#### Графики")
@@ -361,6 +531,8 @@ def admin_stats() -> None:
                         "Гранты": int(r["grants"] or 0),
                         "Конференции": int(r["conferences"] or 0),
                         "Конкурсы": int(r["contests"] or 0),
+                        "Стипендии": int(r["scholarships"] or 0),
+                        "Статьи": int(r["articles"] or 0),
                     }
                     for r in by_person
                 ]
@@ -392,6 +564,8 @@ def admin_stats() -> None:
                     "Гранты": r["grants"] or 0,
                     "Конференции": r["conferences"] or 0,
                     "Конкурсы": r["contests"] or 0,
+                    "Стипендии": r["scholarships"] or 0,
+                    "Статьи": r["articles"] or 0,
                 }
                 for r in by_person
             ],
@@ -454,7 +628,7 @@ def admin_all_participations() -> None:
         }
     )
 
-    f1, f2, f3, f4, f5 = st.columns(5)
+    f1, f2, f3, f4, f5, f6 = st.columns([3, 2, 3, 2, 2, 2])
     with f1:
         uid = st.selectbox(
             "Участник",
@@ -473,6 +647,9 @@ def admin_all_participations() -> None:
         date_from = st.date_input("Дата с", value=None)
     with f5:
         date_to = st.date_input("Дата по", value=None)
+    with f6:
+        st.write("")
+        no_ach = st.checkbox("Без номера достижения", key="filter_no_ach")
 
     rows = db.list_all_participations(
         user_id=uid if uid else None,
@@ -480,6 +657,7 @@ def admin_all_participations() -> None:
         event_id=eid if eid else None,
         date_from=date_from.isoformat() if date_from else None,
         date_to=date_to.isoformat() if date_to else None,
+        without_achievement=no_ach,
     )
 
     st.caption(f"Найдено: {len(rows)}")
@@ -495,6 +673,8 @@ def admin_all_participations() -> None:
                 "Мероприятие": r["title"],
                 "Тип": r["type"],
                 "Дата": r["event_date"],
+                "Номер достижения": r.get("achievement_number") or "",
+                "Индексация": r.get("indexing") or "",
                 "Добавлено": r["joined_at"][:19],
             }
             for r in rows
@@ -516,15 +696,338 @@ def admin_all_participations() -> None:
             st.rerun()
 
 
+# ── Admin: meetings (заседания СНО) ─────────────────────────────────────────
+
+OTHER_LOCATION = "другая локация (ввести ниже)…"
+MEETING_FORMS = ("заседание", "заседания", "заседаний")
+
+
+def _fmt_date(d: date) -> str:
+    return d.strftime("%d.%m.%Y")
+
+
+def admin_meetings() -> None:
+    st.subheader("Заседания и мероприятия СНО")
+    st.caption(
+        "Все мероприятия СНО для отчёта: заседания, а также конференции, форумы, круглые "
+        "столы, где выступали члены СНО. В отчёте — единый список по дате."
+    )
+    ss = st.session_state
+
+    choices = _year_choices()
+    if ss.get("meet_year") not in choices:
+        ss["meet_year"] = date.today().year
+    year = st.selectbox("Год", choices, key="meet_year")
+
+    with st.expander("➕ Добавить заседание / мероприятие", expanded=bool(ss.get("mf_event_id"))):
+        _meeting_add_form(year)
+    _show_msgs("mf_msg")
+
+    meetings = db.list_meetings(year)
+    n_meet = sum(1 for m in meetings if m["kind"] == db.DEFAULT_MEETING_KIND)
+    st.markdown(
+        f"**{year} год: {ru_text.with_count(len(meetings), ACTIVITY_FORMS)} в отчёте** "
+        f"(из них {ru_text.with_count(n_meet, MEETING_FORMS)})"
+    )
+    if not meetings:
+        st.info("За этот год записей пока нет.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "№": m["number"],
+                "Вид": m["kind"],
+                "Дата": _fmt_date(m["meeting_date"]),
+                "Время": m["meeting_time"],
+                "Локация": m["location"],
+                "Тема": m["topic"],
+                "Формат": m["format"],
+            }
+            for m in meetings
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.markdown("#### Редактирование")
+    for m in meetings:
+        mid = m["id"]
+        short = m["topic"] if len(m["topic"]) <= 70 else m["topic"][:70] + "…"
+        with st.expander(
+            f"{m['number']}. {_fmt_date(m['meeting_date'])}, {m['meeting_time']} · {m['kind']} — {short}"
+        ):
+            if m.get("event_id"):
+                st.caption("Связано с мероприятием участников (не будет предложено повторно).")
+            known, other = db.split_formats(m["format"])
+            with st.form(f"edit_meeting_{mid}"):
+                c1, c2, c3 = st.columns(3)
+                e_date = c1.date_input("Дата", value=m["meeting_date"], format="DD.MM.YYYY")
+                e_time = c2.text_input("Время (ЧЧ:ММ)", value=m["meeting_time"])
+                kinds = list(db.MEETING_KINDS)
+                e_kind = c3.selectbox(
+                    "Вид", kinds, index=kinds.index(m["kind"]) if m["kind"] in kinds else 0
+                )
+                e_loc = st.text_input("Локация", value=m["location"])
+                e_topic = st.text_area("Тема заседания", value=m["topic"])
+                e_formats = st.multiselect("Формат", db.MEETING_FORMATS, default=known)
+                e_other = st.text_input("Другой формат (необязательно)", value=other)
+                col_save, col_del = st.columns(2)
+                save = col_save.form_submit_button("Сохранить")
+                delete = col_del.form_submit_button("Удалить")
+                if save:
+                    fmt = db.join_formats(e_formats, e_other)
+                    if not e_topic.strip() or not e_loc.strip() or not fmt:
+                        st.error("Заполните тему, локацию и формат.")
+                    else:
+                        try:
+                            db.update_meeting(mid, e_date, e_time, e_loc, e_topic, fmt, kind=e_kind)
+                            st.success("Сохранено.")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+                if delete:
+                    ss[f"confirm_del_m_{mid}"] = True
+
+            confirm_key = f"confirm_del_m_{mid}"
+            if ss.get(confirm_key):
+                st.warning(f"Удалить запись от {_fmt_date(m['meeting_date'])}? Это необратимо.")
+                b1, b2, _ = st.columns([1, 1, 4])
+                if b1.button("Да, удалить", key=f"yes_m_{mid}", type="primary"):
+                    db.delete_meeting(mid)
+                    ss.pop(confirm_key, None)
+                    st.rerun()
+                if b2.button("Отмена", key=f"no_m_{mid}"):
+                    ss.pop(confirm_key, None)
+                    st.rerun()
+
+
+ACTIVITY_FORMS = ("запись", "записи", "записей")
+
+_MF_DEFAULTS = {
+    "mf_time": db.DEFAULT_MEETING_TIME,
+    "mf_kind": db.DEFAULT_MEETING_KIND,
+    "mf_loc_other": "",
+    "mf_topic": "",
+    "mf_formats": [],
+    "mf_fmt_other": "",
+    "mf_event_id": None,
+    "mf_from_event": None,
+}
+
+
+def _mf_reset() -> None:
+    st.session_state.update({k: (list(v) if isinstance(v, list) else v) for k, v in _MF_DEFAULTS.items()})
+    st.session_state["mf_date"] = date.today()
+    st.session_state.pop("mf_loc_pick", None)  # → last used location on next run
+
+
+def _prefill_from_event() -> None:
+    """on_change of «Добавить из мероприятий участников»: prefill the add form."""
+    ss = st.session_state
+    ev = (ss.get("mf_events_map") or {}).get(ss.get("mf_from_event"))
+    if not ev:
+        ss["mf_event_id"] = None
+        return
+    ss["mf_event_id"] = ev["event_id"]
+    ss["mf_date"] = db._to_date(ev["event_date"])
+    ss["mf_kind"] = ev["suggested_kind"]
+    ss["mf_topic"] = ev["suggested_topic"]
+    ss["mf_formats"] = list(ev["suggested_formats"])
+    ss["mf_fmt_other"] = ""
+    ss["mf_loc_pick"] = OTHER_LOCATION
+    ss["mf_loc_other"] = ""
+
+
+def _submit_meeting() -> None:
+    ss = st.session_state
+    pick = ss.get("mf_loc_pick", OTHER_LOCATION)
+    location = (ss.get("mf_loc_other") or "").strip() or ("" if pick == OTHER_LOCATION else pick)
+    fmt = db.join_formats(ss.get("mf_formats") or [], ss.get("mf_fmt_other") or "")
+    topic = (ss.get("mf_topic") or "").strip()
+    if not topic:
+        ss["mf_msg"] = ("error", "Укажите тему.")
+        return
+    if not location:
+        ss["mf_msg"] = ("error", "Укажите локацию.")
+        return
+    if not fmt:
+        ss["mf_msg"] = ("error", "Выберите формат или впишите свой.")
+        return
+    try:
+        d = ss.get("mf_date") or date.today()
+        db.add_meeting(d, ss.get("mf_time"), location, topic, fmt,
+                       kind=ss.get("mf_kind"), event_id=ss.get("mf_event_id"))
+    except ValueError as e:
+        ss["mf_msg"] = ("error", str(e))
+        return
+    ss["mf_msg"] = ("success", "Запись добавлена.")
+    ss["meet_year"] = d.year
+    _mf_reset()
+
+
+def _meeting_add_form(year: int) -> None:
+    ss = st.session_state
+    if "mf_date" not in ss:
+        _mf_reset()
+
+    events = db.unlinked_member_events(year)
+    ss["mf_events_map"] = {e["event_id"]: e for e in events}
+    if ss.get("mf_from_event") not in ss["mf_events_map"]:
+        ss["mf_from_event"] = None
+    if events:
+        emap = ss["mf_events_map"]
+        st.selectbox(
+            "Добавить из мероприятий участников (необязательно)",
+            [None, *emap.keys()],
+            key="mf_from_event",
+            on_change=_prefill_from_event,
+            format_func=lambda eid: "— не выбрано —" if eid is None else (
+                f"{db._to_date(emap[eid]['event_date']).strftime('%d.%m.%Y')} · {emap[eid]['title']} "
+                f"({emap[eid]['type']}, участников: {emap[eid]['participants_count']})"
+            ),
+        )
+    else:
+        st.caption(f"Мероприятий участников за {year} год, ещё не внесённых в отчёт, нет.")
+
+    c1, c2, c3 = st.columns(3)
+    c1.date_input("Дата", key="mf_date", format="DD.MM.YYYY")
+    c2.text_input("Время (ЧЧ:ММ)", key="mf_time")
+    c3.selectbox("Вид", db.MEETING_KINDS, key="mf_kind")
+    recent = db.recent_locations()
+    if recent:
+        options = [*recent, OTHER_LOCATION]
+        if ss.get("mf_loc_pick") not in options:
+            ss["mf_loc_pick"] = options[0]
+        st.selectbox("Локация (последние использованные)", options, key="mf_loc_pick")
+        st.text_input("Другая локация", key="mf_loc_other",
+                      placeholder="Заполните, если нужной локации нет в списке")
+    else:
+        ss["mf_loc_pick"] = OTHER_LOCATION
+        st.text_input("Локация", key="mf_loc_other",
+                      placeholder="Например: Главный корпус, 031 ауд.")
+    st.text_area("Тема заседания", key="mf_topic")
+    st.multiselect("Формат", db.MEETING_FORMATS, key="mf_formats")
+    st.text_input("Другой формат (необязательно)", key="mf_fmt_other",
+                  placeholder="Например: Международная конференция")
+    st.button("Добавить заседание", type="primary", key="mf_submit", on_click=_submit_meeting)
+
+
+# ── Admin: report ───────────────────────────────────────────────────────────
+
+
+def admin_report() -> None:
+    st.subheader("Отчёт о проведенных заседаниях")
+    choices = _year_choices()
+    year = st.selectbox("Год отчёта", choices, key="report_year")
+    settings = db.get_report_settings()
+    meetings = db.list_meetings(year)
+
+    if settings["sno_name"] == db.DEFAULT_SNO_NAME or not any(
+        s["name"] for s in settings["signatories"]
+    ):
+        st.info("Проверьте название СНО и подписантов во вкладке «Настройки».")
+
+    if meetings:
+        st.caption(
+            f"В отчёт попадёт {ru_text.with_count(len(meetings), ACTIVITY_FORMS)} "
+            "(заседания и другие мероприятия, единая нумерация по дате). "
+            f"Заголовок: «Отчет о проведенных заседаниях СНО «{settings['sno_name']}» в {year} году»."
+        )
+    else:
+        st.warning(
+            f"За {year} год заседаний и мероприятий нет — в документе будет только шапка "
+            "таблицы. Добавьте их во вкладке «Заседания и мероприятия»."
+        )
+
+    try:
+        docx_bytes = report.build_meetings_docx(
+            meetings,
+            year,
+            settings["sno_name"],
+            settings["appendix_label"],
+            settings["signatories"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Не удалось сформировать отчёт: {exc.__class__.__name__}: {exc}")
+        docx_bytes = None
+    if docx_bytes:
+        st.download_button(
+            "⬇️ Скачать отчёт (.docx)",
+            data=docx_bytes,
+            file_name=f"Отчет_о_заседаниях_СНО_{year}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
+            key="dl_report_docx",
+        )
+
+    st.markdown("#### Выгрузка в Excel")
+    df, dt = db.year_range(year)
+    parts = db.list_all_participations(date_from=df, date_to=dt)
+    st.caption(
+        f"Все участия за {year} год ({len(parts)}) и список заседаний — на отдельных листах."
+    )
+    st.download_button(
+        "⬇️ Участия за год (.xlsx)",
+        data=report.build_year_xlsx(parts, meetings),
+        file_name=f"Участия_СНО_{year}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_year_xlsx",
+    )
+
+
+# ── Admin: report settings ──────────────────────────────────────────────────
+
+
+def admin_settings() -> None:
+    st.subheader("Настройки отчёта")
+    s = db.get_report_settings()
+    with st.form("report_settings"):
+        sno_name = st.text_input(
+            "Название СНО (то, что в кавычках «…» в заголовке отчёта)", value=s["sno_name"]
+        )
+        appendix = st.text_input("Надпись над заголовком", value=s["appendix_label"])
+        st.markdown("**Подписанты** (строки можно добавлять и удалять)")
+        sig_df = pd.DataFrame(
+            s["signatories"] or [{"position": "", "name": ""}], columns=["position", "name"]
+        )
+        edited = st.data_editor(
+            sig_df,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key="signatories_editor",
+            column_config={
+                "position": st.column_config.TextColumn("Должность", width="large"),
+                "name": st.column_config.TextColumn("ФИО (кратко, напр. Вершинина А.В.)"),
+            },
+        )
+        if st.form_submit_button("Сохранить настройки", type="primary"):
+            rows = edited.fillna("").to_dict("records")
+            db.save_report_settings(sno_name, appendix, rows)
+            st.success("Настройки сохранены.")
+            st.rerun()
+
+    st.markdown("**Как будут выглядеть подписи:**")
+    for sig in s["signatories"]:
+        st.text(f"{sig['position']} {report.SIGNATURE_LINE}/{sig['name']}")
+
+
 def admin_panel(user: dict) -> None:
     st.title("Панель лидера СНО")
-    tab1, tab2, tab3 = st.tabs(["Участники", "Статистика", "Все участия"])
-    with tab1:
+    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все участия", "Настройки"])
+    with tabs[0]:
         admin_members(user)
-    with tab2:
+    with tabs[1]:
         admin_stats()
-    with tab3:
+    with tabs[2]:
+        admin_meetings()
+    with tabs[3]:
+        admin_report()
+    with tabs[4]:
         admin_all_participations()
+    with tabs[5]:
+        admin_settings()
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
