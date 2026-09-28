@@ -293,9 +293,7 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
             dup = ach.find_duplicate_publication(title, ss.get(f("year")), ss.get(f("doi")),
                                                  exclude_id=record["id"] if record else None)
             if dup:
-                st.warning(f"Похоже, эта статья уже внесена: «{dup['title']}» — запись участника "
-                           f"{dup['owner_name'] or 'СНО'}. Статья считается один раз: попросите его "
-                           f"добавить вас соавтором.")
+                st.warning(ach.duplicate_message(dup, owner_id))
     if form == "doklad" and not ss.get(f("ochno"), True):
         st.caption("Заочный доклад сохранится, но в годовой отчёт не попадёт.")
     st.button("Сохранить изменения" if record else "Сохранить", type="primary", key=_k(pfx, "save"),
@@ -316,7 +314,9 @@ def _authors_block(pfx: str, names: dict, owner_id: Optional[int], acting: dict,
     ss.setdefault(f("n_co"), 0)
     n = int(st.number_input("Соавторов", min_value=0, max_value=30, step=1, key=f("n_co"),
                             help="Соавторы вносятся строками: участник СНО из списка или ФИО текстом, "
-                                 "и доля участия. Соавторы не получают отдельную запись."))
+                                 "и доля участия. Соавтор, выбранный из списка участников СНО, увидит "
+                                 "статью в своих «Мои достижения» (только просмотр). Отдельной записи "
+                                 "у соавторов нет - в отчёт статья идёт один раз."))
     member_opts = [NONE, *[u for u in names if u != owner_id]]
     total = ss.get(f("owner_share")) or 0
     for i in range(n):
@@ -357,6 +357,8 @@ def _rec_caption(r: dict) -> str:
         parts.append(f"тема: «{r['topic']}»")
     if r["form"] == "doklad" and not r["ochno"]:
         parts.append("заочно — не в отчёте")
+    if r.get("role") == "coauthor":
+        parts.append(f"ваша доля: {ach._share_str(r.get('my_share'))}")
     if r["form"] == "publication":
         parts.append(ach.shares_text(r))
         others = [p["name"] for p in r["people"] if p["name"]]
@@ -368,14 +370,19 @@ def _rec_caption(r: dict) -> str:
 
 
 def member_list(user: dict) -> None:
-    """«Мои достижения»: grouped by kind, edit / delete own records."""
-    recs = ach.list_achievements(owner_id=user["id"])
+    """«Мои достижения»: grouped by kind, edit / delete own records; publications where the
+    member is a linked co-author are shown read-only («Соавтор, внёс(ла): …»)."""
+    recs = ach.list_achievements(owner_id=user["id"], with_coauthored=True)
     st.subheader(f"Мои достижения ({len(recs)})")
     show_msgs("mine_msg")
     if not recs:
         st.info("Пока нет записей. Добавьте первую выше.")
         return
-    todo = [r for r in recs if r["issues"]]
+    n_co = sum(1 for r in recs if r["role"] == "coauthor")
+    if n_co:
+        st.caption(f"В том числе в соавторстве: {n_co} - статьи, где другой участник указал вас "
+                   "соавтором. Их может изменить только внесший (или админ); в отчёт статья идёт один раз.")
+    todo = [r for r in recs if r["issues"] and r["role"] == "owner"]
     if todo:
         st.warning(f"Требуют заполнения: {len(todo)} — отмечены значком «⚠ заполните». "
                    "Без уровня/подпункта запись не попадёт в годовой отчёт.")
@@ -385,20 +392,26 @@ def member_list(user: dict) -> None:
     for label, items in groups.items():
         st.markdown(f"##### {label} ({len(items)})")
         for r in items:
-            _record_row(r, user, owner_only=True)
+            _record_row(r, user, owner_only=True, read_only=r["role"] == "coauthor")
 
 
-def _record_row(r: dict, acting: dict, owner_only: bool) -> None:
+def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False) -> None:
     rid = r["id"]
     c1, c2, c3, c4, c5 = st.columns([5, 2, 2, 1, 1], vertical_alignment="center")
     title = r["title"] or "(без названия)"
-    c1.markdown(f"**{title}**" + ("  \n:orange-badge[⚠ заполните: " + ", ".join(r["issues"]) + "]"
-                                   if r["issues"] else ""))
+    if read_only:
+        c1.markdown(f"**{title}**  \n:blue-badge[Соавтор, внёс(ла): {ach.short_name(r['owner_name']) or 'СНО'}]")
+    else:
+        c1.markdown(f"**{title}**" + ("  \n:orange-badge[⚠ заполните: " + ", ".join(r["issues"]) + "]"
+                                       if r["issues"] else ""))
     cap = _rec_caption(r)
     if cap:
         c1.caption(cap)
     c2.write(ach.fmt_date(r["date_from"]) + (f"–{ach.fmt_date(r['date_to'])}" if r["date_to"] and r["form"] != "publication" else ""))
     c3.caption(f"№ {r['number']}" if r["number"] else "без номера")
+    if read_only:
+        c4.caption("👁", help="Только просмотр: изменить или удалить может внесший участник или админ")
+        return
     edit_key = f"edit_{rid}"
     if c4.button("✏️", key=f"btn_edit_{rid}", help="Изменить"):
         st.session_state[edit_key] = not st.session_state.get(edit_key, False)
@@ -426,8 +439,11 @@ def year_summary_text(user: dict, year: int) -> tuple[bool, str]:
     if not items:
         return False, f"В {year} году у тебя пока нет записей — самое время добавить первое достижение! 🚀"
     total = sum(n for _, n in items)
+    n_co = ach.coauthored_count(user["id"], year)
+    pub = ach.kind_by_code("publication")["label"]
     return True, (f"В {year} году у тебя {ru_text.with_count(total, RECORD_FORMS)}: "
-                  + ", ".join(f"{k.lower()} — {n}" for k, n in items) + ".")
+                  + ", ".join(f"{k.lower()} — {n}" + (f" (в соавторстве - {n_co})" if n_co and k == pub else "")
+                              for k, n in items) + ".")
 
 
 # ── Admin: all achievements ─────────────────────────────────────────────────

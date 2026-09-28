@@ -408,6 +408,90 @@ def run_cache(target) -> None:  # noqa: ANN001
     print("  read cache: hits, isolation, invalidation on writes OK")
 
 
+def run_coauthors(target) -> None:  # noqa: ANN001
+    """Linked co-authors see the article read-only; report / SNO stats count it once."""
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    a = db.create_user("co_a", "pass12345", "Авторов Андрей Андреевич", db_path=target)
+    b = db.create_user("co_b", "pass12345", "Бетова Белла Борисовна", db_path=target)
+    c = db.create_user("co_c", "pass12345", "Цветков Цезарь Цезаревич", db_path=target)
+    A, B, C = (db.get_user_by_id(x, db_path=target) for x in (a, b, c))
+    K = ach.kind_by_code("publication", target)
+    rinc = ach.row_by_code("I02.rinc", target)["id"]
+    base_total = ach.report_data(2026, db_path=target)["total"]
+    art = {"kind_id": K["id"], "row_id": rinc, "title": "Совместная статья о кормах", "journal": "Вестник",
+           "year": 2026, "doi": "10.1000/co.1", "owner_share": 50,
+           "coauthors": [{"user_id": b, "name": B["full_name"], "share": 30},
+                         {"name": "Внешний Виктор Викторович", "share": 20}]}
+    aid = ach.save_achievement(art, A, db_path=target)["id"]
+    # free-text co-author with a member's exact name: no name matching, C sees nothing
+    txt = ach.save_achievement({**art, "title": "Статья с текстовым соавтором", "doi": "",
+                                "coauthors": [{"name": C["full_name"], "share": 50}]}, A, db_path=target)["id"]
+    mine_b = ach.list_achievements(owner_id=b, with_coauthored=True, db_path=target)
+    assert [r["id"] for r in mine_b] == [aid] and mine_b[0]["role"] == "coauthor"
+    assert mine_b[0]["my_share"] == 30 and mine_b[0]["owner_name"] == A["full_name"]
+    assert ach.list_achievements(owner_id=b, db_path=target) == []  # owner-only view unchanged
+    assert ach.list_achievements(owner_id=c, with_coauthored=True, db_path=target) == []
+    mine_a = ach.list_achievements(owner_id=a, with_coauthored=True, db_path=target)
+    assert {r["id"] for r in mine_a} == {aid, txt} and all(r["role"] == "owner" for r in mine_a)
+    assert ach.member_year_summary(b, 2026, db_path=target) == [("Публикация", 1)]
+    assert ach.coauthored_count(b, 2026, db_path=target) == 1 and ach.coauthored_count(a, 2026, db_path=target) == 0
+    assert ach.short_name(A["full_name"]) == "Авторов А.А."
+    # read-only for the co-author, owner and admin may edit
+    try:
+        ach.save_achievement({**art, "title": "Взлом"}, B, achievement_id=aid, db_path=target)
+        raise AssertionError("co-author must not edit")
+    except ValueError as e:
+        assert "только свои" in str(e)
+    assert not ach.delete_achievement(aid, owner_id=b, db_path=target)
+    # report and SNO-level stats: exactly once
+    data = ach.report_data(2026, db_path=target)
+    assert data["total"] == base_total + 2
+    ids = [r["id"] for ind in data["indicators"] for row in ind["rows"] for r in row["records"]]
+    assert ids.count(aid) == 1
+    per = {p["user_id"]: p for p in ach.stats_by_person(2026, db_path=target)}
+    assert per[a]["total"] == 2 and b not in per  # Топ-5: the owner only
+    recs = ach.list_achievements(year=2026, db_path=target)
+    assert [r["id"] for r in recs].count(aid) == 1
+    ov = [e for e in ach.events_overview(2026, db_path=target) if e["title"] == art["title"]]
+    assert len(ov) == 1 and ov[0]["records"] == 1 and ov[0]["people"] == 2
+    # second author tries to enter the same article → hint, nothing saved
+    for who, needle in ((B, "уже указаны в ней соавтором"), (C, "попросите"), (A, "ваша запись")):
+        try:
+            ach.save_achievement({**art, "coauthors": [], "owner_share": 100}, who, db_path=target)
+            raise AssertionError("duplicate must be refused")
+        except ach.DuplicateAchievement as e:
+            assert needle in str(e), str(e)
+    # validation: owner is not his own co-author, a member only once
+    for bad in ([{"user_id": a, "name": "x", "share": 10}],
+                [{"user_id": b, "name": "x", "share": 10}, {"user_id": b, "name": "x", "share": 10}]):
+        try:
+            ach.save_achievement({**art, "title": "Новая", "doi": "", "coauthors": bad}, A, db_path=target)
+            raise AssertionError("bad co-authors must be refused")
+        except ValueError:
+            pass
+    # safety net: the same article stored twice (e.g. legacy / direct DB) counts once
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text(
+            "INSERT INTO achievements (kind_id, subpoint_id, indicator_id, row_id, owner_id, title, date_from, "
+            "date_to, ochno, owner_share, details, created_at) SELECT kind_id, subpoint_id, indicator_id, row_id, "
+            ":b, title, date_from, date_to, ochno, 100, details, created_at FROM achievements WHERE id = :id"),
+            {"b": b, "id": aid})
+    data2 = ach.report_data(2026, db_path=target)
+    assert data2["total"] == data["total"]
+    dup = next(r for r in ach.list_achievements(owner_id=b, db_path=target))
+    assert not dup["counted"] and dup["dup_of"]["id"] == aid and any("дубль" in i for i in dup["issues"])
+    assert any(w["id"] == dup["id"] for w in data2["warnings"])
+    assert ach.delete_achievement(dup["id"], owner_id=b, db_path=target)
+    # cache invalidation: owner removes the co-author → gone from B's list immediately
+    ach.save_achievement({**art, "coauthors": [{"name": "Внешний Виктор Викторович", "share": 20}]}, A,
+                         achievement_id=aid, db_path=target)
+    assert ach.list_achievements(owner_id=b, with_coauthored=True, db_path=target) == []
+    assert ach.member_year_summary(b, 2026, db_path=target) == []
+    print("  co-authors: linked member sees article read-only, free text ignored, report/stats count once, "
+          "duplicate hint + safety net OK")
+
+
 def run_all(target, fresh) -> None:  # noqa: ANN001
     """target: DB for catalog/fixture tests (fresh); fresh(): returns a new empty DB target."""
     db.init_db(db_path=target, seed_admin=True)
@@ -417,3 +501,4 @@ def run_all(target, fresh) -> None:  # noqa: ANN001
     run_orphans_and_meetings(target)
     run_fixtures_report(target)
     run_migration(fresh())
+    run_coauthors(fresh())

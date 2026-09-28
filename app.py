@@ -33,7 +33,7 @@ def _engine():
 
 # Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
 # push without restarting the process, so a cached init would never re-run.
-SCHEMA_VERSION = "2026-09-25-annual"
+SCHEMA_VERSION = "2026-09-28-coauthors"
 
 
 @st.cache_resource(show_spinner="Подключение к базе данных…")

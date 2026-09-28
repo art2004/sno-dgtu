@@ -344,6 +344,8 @@ _SCHEMA = [
         user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
         name TEXT NOT NULL, share REAL, legacy_pid INTEGER UNIQUE)""",
     "CREATE INDEX IF NOT EXISTS idx_ach_people ON achievement_people(achievement_id)",
+    # co-authors see linked publications in «Мои достижения» (lookup by user id)
+    "CREATE INDEX IF NOT EXISTS idx_ach_people_user ON achievement_people(user_id)",
 ]
 
 
@@ -806,6 +808,20 @@ def find_duplicate_publication(title: str, year: Optional[int], doi: Optional[st
     return None
 
 
+def duplicate_message(dup: dict, user_id: Optional[int], db_path: DbTarget = None) -> str:
+    """Hint for a second author who tries to enter an article that is already in the base."""
+    owner = dup.get("owner_name") or "СНО"
+    head = f"Эта статья уже внесена: «{dup['title']}» - запись участника {owner}."
+    if user_id and dup.get("owner_id") == user_id:
+        return head + " Это ваша запись - её можно изменить в «Мои достижения»."
+    rec = get_achievement(dup["id"], db_path)
+    if user_id and rec and any(p["user_id"] == user_id for p in rec["people"]):
+        return (head + " Вы уже указаны в ней соавтором, поэтому статья уже отображается в ваших "
+                "«Мои достижения». Вносить её второй раз не нужно (в отчёт статья идёт один раз).")
+    return (head + " Если вы соавтор - попросите его выбрать вас из списка участников СНО в соавторах: "
+            "тогда статья появится и в ваших «Мои достижения», а в отчёт пойдёт один раз.")
+
+
 def _details(raw: Any) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -932,16 +948,18 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
                      if (c.get("name") or "").strip() or c.get("share") not in (None, "")]
         validate_shares(data.get("owner_share"), coauthors)
         owner_share = _num(data.get("owner_share"))
-        people = [{"user_id": c.get("user_id") or None, "name": c["name"].strip(), "share": _num(c.get("share"))}
-                  for c in coauthors]
+        people = [{"user_id": int(c["user_id"]) if c.get("user_id") else None, "name": c["name"].strip(),
+                   "share": _num(c.get("share"))} for c in coauthors]
+        linked = [p["user_id"] for p in people if p["user_id"]]
+        if owner_id and int(owner_id) in linked:
+            raise ValueError("Главный автор не может быть указан ещё и соавтором")
+        if len(linked) != len(set(linked)):
+            raise ValueError("Один и тот же участник СНО указан соавтором дважды")
         details["main_pos"] = min(max(int(data.get("main_pos") or 1), 1), len(people) + 1)
         dup = find_duplicate_publication(title, details.get("year"), details.get("doi"),
                                          exclude_id=achievement_id, db_path=db_path)
         if dup:
-            raise DuplicateAchievement(
-                f"Эта статья уже внесена: «{dup['title']}» — запись участника "
-                f"{dup['owner_name'] or 'СНО'}. Если вы соавтор — попросите его добавить вас "
-                f"в список соавторов (статья считается один раз).")
+            raise DuplicateAchievement(duplicate_message(dup, owner_id, db_path))
     elif any(f[2] == "people" for f in FORMS[form]):
         member_names = {u["id"]: u["full_name"] for u in db.list_users(active_only=False, db_path=db_path)}
         seen: set[int] = set()
@@ -1070,6 +1088,7 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
                 + ", ".join(":" + n for n in names) + ") ORDER BY sort_order, id"), dict(zip(names, chunk)))):
             people.setdefault(p["achievement_id"], []).append(p)
     has_rows = {r[0] for r in conn.execute(text("SELECT DISTINCT indicator_id FROM indicator_rows"))}
+    dup_of = _publication_duplicates(conn) if any(r["kind_form"] == "publication" for r in recs) else {}
     for r in recs:
         r["people"] = people.get(r["id"], [])
         r["details"] = _details(r["details"])
@@ -1080,11 +1099,47 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
         else:
             r["form"] = r["kind_form"]
         r["indicator_has_rows"] = r["indicator_id"] in has_rows
+        r["dup_of"] = dup_of.get(r["id"])
         r["counted"] = is_counted(r)
         r["issues"] = record_issues(r)
         if r["details"].get("no_index") and not r["row_id"]:
             r["row_label"] = NO_INDEX_LABEL
     return recs
+
+
+def _publication_keys(title: str, details: dict, date_from: Any) -> list[str]:
+    keys = []
+    doi = normalize_doi(details.get("doi"))
+    if doi:
+        keys.append("doi:" + doi)
+    tn = normalize_title(title)
+    try:
+        year = int(details.get("year") or str(date_from or "")[:4])
+    except (TypeError, ValueError):
+        year = 0
+    if tn and year:
+        keys.append(f"t:{tn}|{year}")
+    return keys
+
+
+def _publication_duplicates(conn) -> dict[int, dict]:  # noqa: ANN001
+    """Same article entered twice (by DOI or title + year, as find_duplicate_publication):
+    {later id: {"id": first id, "owner_name": ...}}. Normally impossible (saving refuses a
+    duplicate), but kept as a safety net so the annual report never counts an article twice."""
+    pubs = _rows(conn.execute(text(
+        "SELECT a.id, a.title, a.details, a.date_from, u.full_name AS owner_name "
+        "FROM achievements a JOIN kinds k ON k.id = a.kind_id LEFT JOIN users u ON u.id = a.owner_id "
+        "WHERE k.form = 'publication' ORDER BY a.id")))
+    first: dict[str, dict] = {}
+    out: dict[int, dict] = {}
+    for p in pubs:
+        keys = _publication_keys(p["title"], _details(p["details"]), p["date_from"])
+        hit = next((first[k] for k in keys if k in first), None)
+        if hit:
+            out[p["id"]] = hit
+        for k in keys:
+            first.setdefault(k, hit or {"id": p["id"], "owner_name": p["owner_name"]})
+    return out
 
 
 @db.cached
@@ -1109,10 +1164,20 @@ def year_cond(year: Optional[int], alias: str = "a") -> tuple[str, dict]:
 def list_achievements(owner_id: Optional[int] = None, year: Optional[int] = None,
                       indicator_id: Optional[int] = None, row_id: Optional[int] = None,
                       kind_id: Optional[int] = None, without_number: bool = False,
-                      needs_fill: bool = False, db_path: DbTarget = None) -> list[dict]:
+                      needs_fill: bool = False, with_coauthored: bool = False,
+                      db_path: DbTarget = None) -> list[dict]:
+    """with_coauthored (needs owner_id): also publications where this member is a co-author
+    linked by user id (picked from the members list); such records get role "coauthor" and
+    my_share. Personal views only - SNO-level lists/report call this without owner_id, so
+    every record appears exactly once there."""
     sql = _SELECT + " WHERE 1=1"
     params: dict[str, Any] = {}
-    if owner_id is not None:
+    if owner_id is not None and with_coauthored:
+        sql += (" AND (a.owner_id = :o OR (k.form = 'publication' AND EXISTS ("
+                "SELECT 1 FROM achievement_people ap WHERE ap.achievement_id = a.id AND ap.user_id = :o "
+                "AND ap.sort_order >= 0 AND ap.name <> '')))")
+        params["o"] = owner_id
+    elif owner_id is not None:
         sql += " AND a.owner_id = :o"
         params["o"] = owner_id
     cond, p2 = year_cond(year)
@@ -1132,6 +1197,12 @@ def list_achievements(owner_id: Optional[int] = None, year: Optional[int] = None
     sql += " ORDER BY a.date_from DESC, a.id DESC"
     with _eng(db_path).connect() as conn:
         recs = _decorate(conn, _rows(conn.execute(text(sql), params)))
+    if owner_id is not None and with_coauthored:
+        for r in recs:
+            mine = r["owner_id"] == owner_id
+            r["role"] = "owner" if mine else "coauthor"
+            r["my_share"] = r["owner_share"] if mine else next(
+                (p["share"] for p in r["people"] if p["user_id"] == owner_id), None)
     if needs_fill:
         recs = [r for r in recs if r["issues"]]
     return recs
@@ -1145,6 +1216,8 @@ def is_counted(r: dict) -> bool:
     if r.get("indicator_has_rows") and r["row_id"] is None:
         return False
     if r["form"] == "doklad" and not r["ochno"]:
+        return False
+    if r.get("dup_of"):  # the same article is already counted in another record
         return False
     return True
 
@@ -1162,6 +1235,9 @@ def record_issues(r: dict) -> list[str]:
                        + (" (было «Без индексации»)" if d.get("legacy_indexing") == "Без индексации" else ""))
         else:
             out.append("укажите уровень" if r["dimension"] == "level" else "выберите подпункт")
+    if r.get("dup_of"):
+        out.append(f"дубль статьи из записи участника {r['dup_of']['owner_name'] or 'СНО'} - "
+                   "в отчёт идёт один раз, эту запись лучше удалить")
     if r["form"] == "publication":
         if r["owner_share"] is None or any(p["share"] is None for p in r["people"]):
             out.append("заполните долю")
@@ -1181,7 +1257,8 @@ def record_issues(r: dict) -> list[str]:
 
 @db.cached
 def member_year_summary(owner_id: int, year: int, db_path: DbTarget = None) -> list[tuple[str, int]]:
-    recs = list_achievements(owner_id=owner_id, year=year, db_path=db_path)
+    """Personal summary: own records + publications where the member is a linked co-author."""
+    recs = list_achievements(owner_id=owner_id, year=year, with_coauthored=True, db_path=db_path)
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["kind_label"]] = counts.get(r["kind_label"], 0) + 1
@@ -1191,7 +1268,9 @@ def member_year_summary(owner_id: int, year: int, db_path: DbTarget = None) -> l
 
 @db.cached
 def stats_by_person(year: Optional[int] = None, db_path: DbTarget = None) -> list[dict]:
-    """Per member: total records, counted in report, with number, by kind."""
+    """Per member: total records, counted in report, with number, by kind.
+    Owner only: a co-authored article counts for its main author (Топ-5 и статистика СНО
+    считают каждую запись один раз); co-authors see it in their personal list/summary."""
     users = db.list_users(active_only=False, db_path=db_path)
     recs = list_achievements(year=year, db_path=db_path)
     out = {u["id"]: {"user_id": u["id"], "full_name": u["full_name"], "login": u["login"], "total": 0,
@@ -1253,6 +1332,19 @@ def available_years(db_path: DbTarget = None) -> list[int]:
 
 
 # ── Report lines ────────────────────────────────────────────────────────────
+
+
+def short_name(full: Optional[str]) -> str:
+    """«Иванов Иван Иванович» → «Иванов И.И.»."""
+    parts = (full or "").split()
+    if len(parts) < 2:
+        return (full or "").strip()
+    return parts[0] + " " + "".join(p[0] + "." for p in parts[1:3])
+
+
+def coauthored_count(user_id: int, year: Optional[int] = None, db_path: DbTarget = None) -> int:
+    recs = list_achievements(owner_id=user_id, year=year, with_coauthored=True, db_path=db_path)
+    return sum(1 for r in recs if r["role"] == "coauthor")
 
 
 def _period(r: dict) -> str:
