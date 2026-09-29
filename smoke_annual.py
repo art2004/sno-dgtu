@@ -12,6 +12,7 @@ from sqlalchemy import text
 import achievements as ach
 import annual_fixtures as fx
 import annual_report
+import auth
 import db
 import report
 
@@ -123,12 +124,14 @@ def run_fixtures_report(target) -> None:  # noqa: ANN001
     # publication line: shares in author order, co-authors printed, counted once
     pub = next(i for i in data["indicators"] if i["code"] == "I02")
     vak = pub["rows"][2]["items"][0][1]
-    assert "Доля участия: 49%, 48%, 1%." in vak and "Шевченко Виктория Николаевна" in vak and "Р-Н-6100-25" in vak
+    assert vak.startswith("(49%) Саркисян Д.С., (48%) Чолутаева Э.Э., (1%) Шевченко В.Н. Sarkisyan, D. S.")
+    assert "Р-Н-6100-25" in vak and "ссылка: https://elibrary.ru/item.asp?id=80000001" in vak
     rinc = pub["rows"][3]["items"][0][1]
     assert rinc.startswith("Мартынюк И.О., Старостин Д.В. Методы") and "DOI: 10.23947/interagro.2025.117-119." in rinc
     assert "Доля участия: 50%, 50%." in rinc
     scopus = pub["rows"][0]["items"][0][1]
-    assert scopus.startswith("Starostin, D.") and "Доля участия: 10%, 10%, 10%." in scopus
+    assert scopus.startswith("(10%) Старостин Д.В., (10%) Марченко С.А., (10%) Мартынюк И.О. Starostin, D.")
+    assert "(2025). Исследование наличия" in scopus
     # per-person: publication counts only for the main author
     per = {r["login"]: r for r in ach.stats_by_person(2025, db_path=target)}
     assert per["martynuk"]["by_kind"].get("Публикация") == 1
@@ -492,6 +495,314 @@ def run_coauthors(target) -> None:  # noqa: ANN001
           "duplicate hint + safety net OK")
 
 
+def _pub(target, owner, extra=None, **kw):  # noqa: ANN001, ANN003
+    K = ach.kind_by_code("publication", target)
+    base = {"kind_id": K["id"], "owner_id": owner["id"], "journal": "Тестовый журнал", "owner_share": 100}
+    return ach.save_achievement({**base, **(extra or {}), **kw}, _admin(target), db_path=target)["id"]
+
+
+def run_v4_pubdate(target) -> None:  # noqa: ANN001
+    """Item 1: full publication date; year-only records stay valid; dedupe unchanged."""
+    db.init_db(db_path=target, seed_admin=True)
+    u = db.get_user_by_id(db.create_user("pd_a", "pass12345", "Датов Дмитрий Дмитриевич", db_path=target),
+                          db_path=target)
+    vak = ach.row_by_code("I02.vak", target)["id"]
+    # new record with a full date
+    a = _pub(target, u, row_id=vak, title="Статья с датой", pub_date="2027-03-15", year=None)
+    rec = ach.get_achievement(a, target)
+    assert rec["date_from"] == "2027-03-15" and rec["date_to"] is None
+    assert rec["details"]["pub_date"] == "2027-03-15" and rec["details"]["year"] == 2027
+    assert ach.pub_date_text(rec) == "15.03.2027"
+    assert rec["id"] in [r["id"] for r in ach.list_achievements(year=2027, db_path=target)]
+    assert a not in [r["id"] for r in ach.list_achievements(year=2026, db_path=target)]
+    line = ach.record_line(rec)
+    assert "(2027). Статья с датой." in line and "15.03.2027" not in line
+    # old shape: only «year» (API callers, legacy rows) -> 01.01-31.12, no pub_date, still valid
+    b = _pub(target, u, row_id=vak, title="Старая статья только с годом", year=2027)
+    old = ach.get_achievement(b, target)
+    assert (old["date_from"], old["date_to"]) == ("2027-01-01", "2027-12-31") and "pub_date" not in old["details"]
+    assert ach.pub_date_text(old) == "2027" and old["issues"] == []
+    # editing an old record with the untouched default date (01.01) keeps it year-only
+    ach.save_achievement({"kind_id": old["kind_id"], "owner_id": u["id"], "row_id": vak, "title": old["title"],
+                          "journal": "Тестовый журнал", "owner_share": 100, "year": 2027, "pub_date": "2027-01-01"},
+                         u, achievement_id=b, db_path=target)
+    old2 = ach.get_achievement(b, target)
+    assert (old2["date_from"], old2["date_to"]) == ("2027-01-01", "2027-12-31") and "pub_date" not in old2["details"]
+    # ... and a picked date turns it into a dated record
+    ach.save_achievement({"kind_id": old["kind_id"], "owner_id": u["id"], "row_id": vak, "title": old["title"],
+                          "journal": "Тестовый журнал", "owner_share": 100, "pub_date": "2027-11-05"},
+                         u, achievement_id=b, db_path=target)
+    assert ach.get_achievement(b, target)["date_from"] == "2027-11-05"
+    # an update that passes no date keeps the stored one
+    ach.save_achievement({"kind_id": old["kind_id"], "owner_id": u["id"], "row_id": vak, "title": old["title"],
+                          "journal": "Другой журнал", "owner_share": 100, "year": 2027}, u, achievement_id=b,
+                         db_path=target)
+    assert ach.get_achievement(b, target)["date_from"] == "2027-11-05"
+    # validation
+    for bad in ({"pub_date": "2027-13-40"}, {"pub_date": "1800-01-01"}, {"pub_date": None, "year": None}):
+        try:
+            _pub(target, u, row_id=vak, title="Плохая дата", **bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    # dedupe by title+year (any day of the year) and by DOI keeps working across shapes
+    for dup in ({"title": " СТАТЬЯ с датой ", "pub_date": "2027-12-31"}, {"title": "Статья с датой", "year": 2027},
+                {"title": "Иное", "pub_date": "2027-06-01", "doi": None}):
+        if dup["title"] == "Иное":
+            _pub(target, u, row_id=vak, title="Иное", pub_date="2027-06-01", doi="10.1/pd.1")
+            dup = {"title": "Совсем другое", "pub_date": "2027-07-07", "doi": "https://doi.org/10.1/PD.1"}
+        try:
+            _pub(target, u, row_id=vak, **dup)
+            raise AssertionError(dup)
+        except ach.DuplicateAchievement:
+            pass
+    # different year -> not a duplicate
+    c = _pub(target, u, row_id=vak, title="Статья с датой", pub_date="2028-03-15")
+    assert c
+    # safety net (reports): dated + year-only copy of the same article counts once
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("INSERT INTO achievements (kind_id, indicator_id, row_id, owner_id, title, date_from, "
+                          "date_to, ochno, owner_share, details, created_at) SELECT kind_id, indicator_id, row_id, "
+                          "owner_id, title, '2027-01-01', '2027-12-31', ochno, 100, "
+                          "'{\"year\": 2027, \"journal\": \"Ж\"}', created_at FROM achievements WHERE id = :id"),
+                     {"id": a})
+    data = ach.report_data(2027, db_path=target)
+    assert sum(1 for r in data["records"] if normalize(r["title"]) == "статья с датой" and r["counted"]) == 1
+    # the date appears in the annual report line and in the Excel export
+    vak_row = next(row for i in data["indicators"] if i["code"] == "I02" for row in i["rows"] if row["id"] == vak)
+    assert any("(2027). " in it[1] and "15.03.2027" not in it[1] for it in vak_row["items"])
+    assert b"" != annual_report.build_achievements_xlsx(data)
+    for r in ach.list_achievements(owner_id=u["id"], db_path=target):
+        ach.delete_achievement(r["id"], db_path=target)
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("DELETE FROM achievements WHERE owner_id = :o"), {"o": u["id"]})
+    db.delete_user(u["id"], db_path=target)
+    print("  publication date: full date stored/edited, year-only records stay valid, dedupe by DOI / title+year OK")
+
+
+def normalize(t: str) -> str:
+    return db.normalize_title(t)
+
+
+def run_v4_bibformat(target) -> None:  # noqa: ANN001
+    """Item 4: ВАК / Белый список (and Scopus/WoS, РИНЦ) print ФИО of owner + co-authors with shares
+    and the bibliographic data in the sample format."""
+    db.init_db(db_path=target, seed_admin=True)
+    ids = {n: db.create_user(f"bf_{n}", "pass12345", full, db_path=target) for n, full in
+           (("o", "Козырев Дмитрий Сергеевич"), ("c", "Поляков Александр"), ("d", "Одабашян Михаил Гагикович"))}
+    owner = db.get_user_by_id(ids["o"], db_path=target)
+    co = [{"user_id": ids["c"], "name": "Поляков Александр", "share": 10},
+          {"user_id": ids["d"], "name": "Одабашян Михаил Гагикович", "share": 10},
+          {"user_id": None, "name": "Иванова Анна Петровна", "share": 5}]
+    common = dict(owner_share=70, coauthors=co, journal="Siberian Journal of Life Sciences and Agriculture",
+                  volume="17", issue="6-2", pages="95-111", link="https://discover-journal.ru/jour/index.php/sjlsa/issue/view/34",
+                  number="Р-Н-1538-25")
+    out = {}
+    for code, title, doi in (("I02.vak", "Влияние воды на прорастание семян ВАК", "10.12731/2658-6649-2025-17-6-2-1538"),
+                             ("I02.white", "Влияние воды на прорастание семян БС", "https://doi.org/10.1/WL.1"),
+                             ("I02.scopus", "Влияние воды на прорастание семян SCOPUS", ""),
+                             ("I02.rinc", "Влияние воды на прорастание семян РИНЦ", "")):
+        aid = _pub(target, owner, row_id=ach.row_by_code(code, target)["id"], title=title, doi=doi,
+                   pub_date="2025-10-01", **common)
+        out[code] = ach.record_line(ach.get_achievement(aid, target))
+    for code in ("I02.vak", "I02.white", "I02.scopus"):
+        line = out[code]
+        # Russian authors with shares in author order (owner first), then Latin, (year), title, journal, vol(issue), pages
+        assert line.startswith("(70%) Козырев Д.С., (10%) Поляков А., (10%) Одабашян М.Г., (5%) Иванова А.П. "), line
+        assert "Kozyrev, D. S., Polyakov, A., Odabashyan, M. G., & Ivanova, A. P. (2025). Влияние воды" in line, line
+        assert " Siberian Journal of Life Sciences and Agriculture, 17(6-2), 95-111" in line and "01.10.2025" not in line, line
+        assert ", ссылка: https://discover-journal.ru/jour/index.php/sjlsa/issue/view/34" in line or \
+            "ссылка: https://discover-journal.ru" in line, line
+        assert line.endswith("Р-Н-1538-25"), line
+    assert "https://doi.org/10.12731/2658-6649-2025-17-6-2-1538 " in out["I02.vak"] + " "
+    assert "https://doi.org/10.1/wl.1" in out["I02.white"]
+    # РИНЦ keeps its layout (nothing else restructured), but the ФИО are printed there too
+    assert "Козырев Дмитрий Сергеевич" in out["I02.rinc"] and "Доля участия: 70%, 10%, 10%, 5%" in out["I02.rinc"]
+    # typed reference (bib) + typed Latin authors: printed as typed, authors put in front, no duplicates
+    aid = _pub(target, owner, row_id=ach.row_by_code("I02.vak", target)["id"], title="Статья со ссылкой",
+               year=2025, owner_share=60, coauthors=[{"name": "Иванова Анна Петровна", "share": 40}],
+               authors_lat="Kozyrev, D., & Ivanova, A.", bib="Kozyrev, D., & Ivanova, A. (2025). Статья со ссылкой. Журнал, 3(1), 5-9",
+               doi="10.5/x.5")
+    line = ach.record_line(ach.get_achievement(aid, target))
+    assert line.startswith("(60%) Козырев Д.С., (40%) Иванова А.П. Kozyrev, D., & Ivanova, A. (2025). Статья со ссылкой. Журнал, 3(1), 5-9")
+    assert line.count("Статья со ссылкой") == 1 and line.endswith("https://doi.org/10.5/x.5"), line
+    # a reference that already names the main author in Russian is not prefixed a second time
+    aid2 = _pub(target, owner, row_id=ach.row_by_code("I02.white", target)["id"], title="Готовая ссылка", year=2025,
+                bib="Козырев Д.С. Готовая ссылка // Журнал. - 2025. - Т. 1.")
+    line2 = ach.record_line(ach.get_achievement(aid2, target))
+    assert line2.startswith("Козырев Д.С. Готовая ссылка") and line2.count("Козырев") == 1 and "Доля участия: 100%" in line2
+    # the same lines reach the annual docx and the Excel export
+    data = ach.report_data(2025, db_path=target)
+    import docx as _docx
+    doc = _docx.Document(io.BytesIO(annual_report.build_annual_docx(data, "", [])))
+    full = "\n".join(c.text for t in doc.tables for row in t.rows for c in row.cells)
+    assert out["I02.vak"] in full and out["I02.white"] in full
+    assert annual_report.build_achievements_xlsx(data)
+    assert ach.translit("Щукин") == "Shchukin" and ach.short_author("Иванов Иван") == "Иванов И."
+    assert ach.short_author("Kozyrev, D.") == "Kozyrev, D." and ach._lat_author("Ёлкин Пётр Юрьевич") == "Elkin, P. Yu."
+    for r in ach.list_achievements(owner_id=ids["o"], db_path=target):
+        ach.delete_achievement(r["id"], db_path=target)
+    for uid in ids.values():
+        db.delete_user(uid, db_path=target)
+    print("  ВАК / Белый список / Scopus: ФИО + доли + латиница + (год) название, журнал, том(вып), стр., ссылка, DOI OK")
+
+
+def run_v4_refresh(target) -> None:  # noqa: ANN001
+    """Item 2: admin cache reset, TTL, data stamp for the auto-refresh."""
+    from sqlalchemy import event
+    eng = db.get_engine(target)
+    users = db.list_users(db_path=target)
+    # a write by ANOTHER process (raw connection without our write watcher) is not seen until TTL / reset
+    import sqlite3
+    path = str(eng.url.database)
+    stamp0 = db.data_stamp(target)
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO users (login, password_hash, full_name, role, created_at, active) "
+                "VALUES ('other_proc', 'x', 'Другой Процесс', 'member', '2026-01-01T00:00:00', 1)")
+    con.commit()
+    con.close()
+    assert not any(u["login"] == "other_proc" for u in db.list_users(db_path=target))  # stale cache
+    assert db.data_stamp(target) != stamp0  # ... but the cheap stamp sees the change
+    db.clear_cache()  # «Обновить данные»
+    assert any(u["login"] == "other_proc" for u in db.list_users(db_path=target))
+    # the TTL alone also fixes it: age the entry
+    con = sqlite3.connect(path)
+    con.execute("UPDATE users SET full_name = 'Другой Процесс 2' WHERE login = 'other_proc'")
+    con.commit()
+    con.close()
+    for k, (v, t, val) in list(db._CACHE.items()):
+        db._CACHE[k] = (v, t - db.CACHE_TTL - 1, val)
+    assert any(u["full_name"] == "Другой Процесс 2" for u in db.list_users(db_path=target))
+    assert 5 <= db.CACHE_TTL <= 600 and db._cache_ttl() == 60.0
+    # the stamp query is a read: it never bumps the version and costs one statement
+    n = {"q": 0}
+
+    def _count(*_a, **_k):  # noqa: ANN002, ANN003
+        n["q"] += 1
+    event.listen(eng, "before_cursor_execute", _count)
+    try:
+        v = db.data_version(target)
+        db.data_stamp(target)
+        assert n["q"] == 1 and db.data_version(target) == v
+    finally:
+        event.remove(eng, "before_cursor_execute", _count)
+    with eng.begin() as conn:
+        conn.execute(text("DELETE FROM users WHERE login = 'other_proc'"))
+    print("  refresh: admin cache reset, 60 s TTL, other-process writes detected by data_stamp (1 query) OK")
+
+
+def run_v4_impersonation(target) -> None:  # noqa: ANN001
+    """Item 3: server-side rules + full UI flow through Streamlit AppTest (cookie keeps the admin)."""
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    ma = db.create_user("imp_m1", "pass12345", "Имитов Иван Иванович", db_path=target)
+    mb = db.create_user("imp_m2", "pass12345", "Отключёнов Олег Олегович", db_path=target)
+    adm2 = db.create_user("imp_adm2", "pass12345", "Второй Админ", "admin", db_path=target)
+    db.update_user(mb, acting_user_id=admin["id"], active=False, db_path=target)
+    T = auth.impersonation_target
+    assert T(admin["id"], ma, db_path=target)["login"] == "imp_m1"
+    for who, whom, msg in ((ma, admin["id"], "только админ"), (admin["id"], admin["id"], "собственная"),
+                           (admin["id"], mb, "отключён"), (admin["id"], adm2, "другим админом"),
+                           (admin["id"], 999999, "не найден")):
+        try:
+            T(who, whom, db_path=target)
+            raise AssertionError((who, whom))
+        except auth.ImpersonationError as e:
+            assert msg in str(e), (msg, str(e))
+    # last-admin safeguards unchanged (impersonation adds no way around them)
+    db.delete_user(adm2, acting_user_id=admin["id"], db_path=target)  # a second admin may go
+    for fn in (lambda: db.delete_user(admin["id"], acting_user_id=admin["id"], db_path=target),
+               lambda: db.update_user(admin["id"], acting_user_id=admin["id"], role="member", db_path=target)):
+        try:
+            fn()
+            raise AssertionError("last admin must stay")
+        except ValueError:
+            pass
+    _impersonation_ui(target, admin, ma)
+    db.delete_user(ma, acting_user_id=admin["id"], db_path=target)
+    db.delete_user(mb, acting_user_id=admin["id"], db_path=target)
+    print("  impersonation: admin-only, never admin/self/disabled, last-admin rules unchanged, UI flow + cookie OK")
+
+
+def _impersonation_ui(target, admin, member_id) -> None:  # noqa: ANN001
+    import os
+    from pathlib import Path
+
+    from streamlit.testing.v1 import AppTest
+
+    app_dir = str(Path(__file__).resolve().parent)
+    old_url, old_pw = os.environ.get("DATABASE_URL"), os.environ.get("ADMIN_PASSWORD")
+    os.environ["DATABASE_URL"] = "sqlite:///" + str(Path(target).resolve())
+    os.environ.pop("ADMIN_PASSWORD", None)
+    cwd = os.getcwd()
+    os.chdir(app_dir)
+    try:
+        db.set_app_setting("sno_name", "Тест", db_path=target)
+        at = AppTest.from_file(str(Path(app_dir) / "app.py"), default_timeout=90)
+        at.session_state["user"] = {"id": admin["id"], "login": admin["login"], "full_name": admin["full_name"],
+                                    "role": "admin"}
+        at.run()
+        assert not at.exception, at.exception
+        assert not any("Вы вошли как" in w.value for w in at.warning)
+        assert any(b.label == "Обновить данные" for b in at.sidebar.button)  # admin refresh button
+        minted = []
+        real_make = auth.make_auth_token
+        auth.make_auth_token = lambda user, *a, **k: (minted.append(user["id"]), real_make(user, *a, **k))[1]
+        at.selectbox(key="imp_pick").set_value(member_id)
+        next(b for b in at.button if b.key == "imp_go").click().run()
+        assert not at.exception, at.exception
+        assert at.session_state["user"]["id"] == member_id and at.session_state["_imp_admin"]["id"] == admin["id"]
+        assert any("Вы вошли как" in w.value and "Имитов" in w.value for w in at.warning)
+        assert any(t.value == "Мои достижения" for t in at.title)  # the member's cabinet
+        assert not any(b.label == "Обновить данные" for b in at.sidebar.button)  # member view: no admin button
+        assert minted == []  # no cookie is (re)issued while impersonating: it keeps the admin identity
+        # a write during impersonation is attributed to the member
+        K = ach.kind_by_code("volunteer", target)
+        ach.save_achievement({"kind_id": K["id"], "row_id": ach.row_by_code("I15.reg", target)["id"],
+                              "title": "Волонтёрство под имитацией", "date_from": "2026-05-05"},
+                             at.session_state["user"], db_path=target)
+        rec = next(r for r in ach.list_achievements(owner_id=member_id, db_path=target))
+        assert rec["owner_id"] == member_id and rec["created_by"] == member_id
+        back = next(b for b in at.button if b.label == "Вернуться в админа" and b.key == "imp_return")
+        back.click().run()
+        assert not at.exception, at.exception
+        assert at.session_state["user"]["id"] == admin["id"] and at.session_state["user"]["role"] == "admin"
+        assert "_imp_admin" not in at.session_state
+        assert not any("Вы вошли как" in w.value for w in at.warning)
+        assert minted == []  # ... and none on the way back either
+        auth.make_auth_token = real_make
+        assert any(t.value == "Панель лидера СНО" for t in at.title)
+        # the admin refresh button clears the caches
+        db.list_users(db_path=target)
+        assert any(k[0].endswith(Path(target).name) for k in db._CACHE)
+        next(b for b in at.sidebar.button if b.label == "Обновить данные").click().run()
+        assert not at.exception, at.exception
+        assert any("Данные обновлены" in s.value for s in at.sidebar.success)
+        # a plain member session (no admin) cannot see the impersonation UI
+        at2 = AppTest.from_file(str(Path(app_dir) / "app.py"), default_timeout=90)
+        at2.session_state["user"] = {"id": member_id, "login": "imp_m1", "full_name": "Имитов Иван Иванович",
+                                     "role": "member"}
+        at2.run()
+        assert not at2.exception and not any(b.label == "Войти как участник" for b in at2.button)
+        assert not any(b.label == "Обновить данные" for b in at2.sidebar.button)
+        # forged impersonation state in a member session is refused: role is re-read from the DB
+        at2.session_state["_imp_admin"] = {"id": member_id, "login": "imp_m1", "full_name": "x", "role": "admin"}
+        at2.run()
+        assert at2.session_state["user"] is None, "forged _imp_admin must log out"
+    finally:
+        os.chdir(cwd)
+        if "real_make" in dir():
+            auth.make_auth_token = real_make
+        for k, v in (("DATABASE_URL", old_url), ("ADMIN_PASSWORD", old_pw)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        db.get_engine(target)
+        for r in ach.list_achievements(owner_id=member_id, db_path=target):
+            ach.delete_achievement(r["id"], db_path=target)
+
+
 def run_all(target, fresh) -> None:  # noqa: ANN001
     """target: DB for catalog/fixture tests (fresh); fresh(): returns a new empty DB target."""
     db.init_db(db_path=target, seed_admin=True)
@@ -502,3 +813,7 @@ def run_all(target, fresh) -> None:  # noqa: ANN001
     run_fixtures_report(target)
     run_migration(fresh())
     run_coauthors(fresh())
+    run_v4_pubdate(fresh())
+    run_v4_bibformat(fresh())
+    run_v4_refresh(fresh())
+    run_v4_impersonation(fresh())

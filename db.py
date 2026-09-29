@@ -151,9 +151,20 @@ def get_engine(db_path: DbTarget = None) -> Engine:
 # statement on an engine created here bumps that URL's data version (and once
 # more when the dirty connection returns to the pool, i.e. after commit), so a
 # write by any session in this process is visible to all sessions immediately.
-# CACHE_TTL bounds staleness for writes from other processes.
+# CACHE_TTL (60 s) bounds staleness for writes from other processes (another server
+# instance, a script, a manual SQL edit): they show up on the next rerun after the TTL
+# without any reboot. Admins can also drop all caches at once («Обновить данные»).
 
-CACHE_TTL = 60.0
+def _cache_ttl() -> float:
+    """Seconds a cached read stays valid without any write. Default 60; override with the
+    CACHE_TTL secret / env variable (clamped to 5..600 s)."""
+    try:
+        return min(max(float(get_setting("CACHE_TTL") or 60), 5.0), 600.0)
+    except (TypeError, ValueError):
+        return 60.0
+
+
+CACHE_TTL = _cache_ttl()
 _CACHE: dict[tuple, tuple[int, float, Any]] = {}
 _VERSIONS: dict[str, int] = {}
 _CACHE_LOCK = threading.Lock()
@@ -173,7 +184,13 @@ def bump_data_version(db_path: Any = None) -> None:
             _CACHE.pop(k, None)
 
 
+def data_version(db_path: DbTarget = None) -> int:
+    """Local write counter of a database (bumped by every write made through this process)."""
+    return _VERSIONS.get(_cache_url(db_path), 0)
+
+
 def clear_cache() -> None:
+    """Drop every cached read of every database (admin button «Обновить данные»)."""
     bump_data_version("*")
 
 
@@ -222,6 +239,22 @@ def cached(fn):  # noqa: ANN001, ANN201
 
     wrapper.uncached = fn
     return wrapper
+
+
+_STAMP_SQL = (
+    "SELECT (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM participations), "
+    "(SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM meetings), (SELECT COUNT(*) FROM settings), "
+    "(SELECT COUNT(*) FROM achievements), (SELECT MAX(id) FROM achievements), "
+    "(SELECT MAX(updated_at) FROM achievements), (SELECT COUNT(*) FROM achievement_people)"
+)
+
+
+def data_stamp(db_path: DbTarget = None) -> str:
+    """Cheap fingerprint of the data (one light query, never cached): changes when rows are
+    added / removed / edited by ANY process. The app compares it every minute to refresh
+    other users' changes on its own."""
+    with get_engine(db_path).connect() as conn:
+        return "|".join(str(v) for v in conn.execute(text(_STAMP_SQL)).one())
 
 
 def is_postgres(db_path: DbTarget = None) -> bool:

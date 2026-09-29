@@ -78,6 +78,10 @@ def _prefill(pfx: str, rec: dict) -> None:
             ss[f(key)] = bool(rec["ochno"])
         elif ftype == "year":
             ss[f(key)] = int(d.get("year") or (rec["date_from"] or str(date.today().year))[:4])
+        elif ftype == "pubdate":
+            # full date when stored; old year-only records show 01.01 of their year
+            y = int(d.get("year") or (rec["date_from"] or str(date.today().year))[:4])
+            ss[f(key)] = date.fromisoformat(d["pub_date"]) if d.get("pub_date") else date(y, 1, 1)
         elif ftype == "ayear":
             ss[f(key)] = d.get("ayear") or ""
         elif ftype == "select":
@@ -257,6 +261,10 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
         elif ftype == "year":
             ss.setdefault(f(key), date.today().year)
             st.number_input(lab, min_value=1990, max_value=2100, step=1, key=f(key))
+        elif ftype == "pubdate":
+            ss.setdefault(f(key), date.today())
+            st.date_input(lab, key=f(key), help=hlp, format="DD.MM.YYYY",
+                          min_value=date(1990, 1, 1), max_value=date(2100, 12, 31))
         elif ftype == "ayear":
             ay_opts = ach.academic_years()
             cur = ss.get(f(key))
@@ -290,7 +298,8 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
     if form == "publication":
         title = (ss.get(f("title")) or "").strip()
         if title or ss.get(f("doi")):
-            dup = ach.find_duplicate_publication(title, ss.get(f("year")), ss.get(f("doi")),
+            pd_ = ss.get(f("pub_date"))
+            dup = ach.find_duplicate_publication(title, pd_.year if pd_ else None, ss.get(f("doi")),
                                                  exclude_id=record["id"] if record else None)
             if dup:
                 st.warning(ach.duplicate_message(dup, owner_id))

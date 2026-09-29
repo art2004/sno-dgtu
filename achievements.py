@@ -146,7 +146,7 @@ SUBPOINTS: list[tuple[str, str, str, str, Optional[str], str]] = [
 ]
 
 # Поля форм: (key, label, type, required, extra). Типы: text, textarea, date, date_opt,
-# select, check, people, authors, year, ayear, meeting. Ключи title/date_from/date_to/topic/
+# select, check, people, authors, year, pubdate, ayear, meeting. Ключи title/date_from/date_to/topic/
 # number/link/ochno — колонки achievements; остальные — details (JSON).
 _TAIL = [("number", "Номер достижения (Р-Н-…, с сайта вуза)", "text", False, {}),
          ("link", "Ссылка на подтверждение", "text", False, {})]
@@ -170,13 +170,21 @@ FORMS: dict[str, list[tuple]] = {
         ("authors", "Авторы и доли участия", "authors", True, {}),
         ("authors_text", "Авторы, как в статье (необязательно)", "text", False,
          {"help": "Например: Мартынюк И.О., Старостин Д.В. Если пусто — список соберётся из строк авторов."}),
+        ("authors_lat", "Авторы латиницей (необязательно)", "text", False,
+         {"help": "Например: Starostin, D., Marchenko, S. Если пусто - для Scopus/WoS, ВАК и Белого списка "
+                  "список соберётся автоматически (транслитерация ФИО); проверьте написание."}),
         ("journal", "Журнал / сборник", "text", True, {}),
-        ("year", "Год публикации", "year", True, {}),
+        ("volume", "Том (необязательно)", "text", False, {}),
+        ("issue", "Выпуск / номер (необязательно)", "text", False, {}),
+        ("pages", "Страницы (необязательно)", "text", False, {"help": "Например: 95-111"}),
+        ("pub_date", "Дата публикации", "pubdate", True,
+         {"help": "День, месяц и год. Старые записи с одним годом остаются верными: показывается 01.01 этого года."}),
         ("link", "Ссылка", "text", False, {}),
         ("doi", "DOI", "text", False, {}),
         ("number", "Номер достижения (Р-Н-…, с сайта вуза)", "text", False, {}),
         ("bib", "Библиографическая ссылка (необязательно)", "textarea", False,
-         {"help": "Если заполнено — в отчёт попадёт как есть (доли участия допишутся, если их нет)."}),
+         {"help": "Если в ней есть название статьи - в отчёт попадёт как есть, а перед ней допишутся ФИО авторов "
+                  "с долями участия (если их там нет). Если это только ссылка - строка соберётся из полей выше."}),
     ],
     "contest": [
         ("title", "Конкурс / кейс-чемпионат", "text", True, {}),
@@ -863,6 +871,46 @@ def validate_shares(owner_share: Any, coauthors: list[dict]) -> float:
     return total
 
 
+def _apply_pub_date(data: dict, old: Optional[dict], vals: dict, details: dict, short: str) -> None:
+    """Publication date. New records store the full date (date_from = the day, date_to empty,
+    details.pub_date + details.year). Old records / callers that pass only ``year`` keep the
+    year-only shape (01.01-31.12), so everything written before stays valid. An old record
+    edited without touching the date (shown as 01.01.YYYY) stays year-only."""
+    raw = data.get("pub_date")
+    if raw in (None, "") and old is not None and (old["details"] or {}).get("pub_date") \
+            and data.get("year") in (None, "", (old["details"] or {}).get("year")):
+        raw = old["details"]["pub_date"]  # caller did not touch the date
+    if raw in (None, ""):
+        y_raw = data.get("year")
+        if y_raw in (None, ""):
+            raise ValueError(f"Заполните поле «{short}»")
+        try:
+            y = int(y_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"Заполните поле «{short}»") from None
+        iso = f"{y}-01-01"
+        explicit = False
+    else:
+        try:
+            iso = _iso(raw)
+            y = int(iso[:4])
+        except (TypeError, ValueError):
+            raise ValueError("Дата публикации указана неверно") from None
+        explicit = True
+        if old is not None and not (old["details"] or {}).get("pub_date") and iso == f"{y}-01-01" \
+                and int(old["details"].get("year") or 0) == y:
+            explicit = False  # untouched default of a year-only record
+    if not 1990 <= y <= 2100:
+        raise ValueError("Год публикации указан неверно")
+    details["year"] = y
+    if explicit:
+        vals["date_from"], vals["date_to"] = iso, None
+        details["pub_date"] = iso
+    else:
+        vals["date_from"], vals["date_to"] = f"{y}-01-01", f"{y}-12-31"
+        details.pop("pub_date", None)
+
+
 def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int] = None,
                      db_path: DbTarget = None) -> dict:
     """Create/update a record. data keys: kind_id, subpoint_id, row_id, owner_id, fields
@@ -919,6 +967,9 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
                 raise ValueError("Год публикации указан неверно")
             vals["date_from"], vals["date_to"] = f"{y}-01-01", f"{y}-12-31"
             details["year"] = y
+            continue
+        if ftype == "pubdate":
+            _apply_pub_date(data, old, vals, details, short)
             continue
         if ftype in ("date", "date_opt"):
             v = _iso(v)
@@ -1376,15 +1427,171 @@ def shares_text(r: dict) -> str:
     return "доля участия: " + ", ".join(_share_str(s) for _, s in publication_authors(r))
 
 
-def publication_line(r: dict) -> str:
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y",
+    "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit(word: str) -> str:
+    """Simple Russian → Latin transliteration (BGN/APA style: Поляков → Polyakov)."""
+    out = "".join(_TRANSLIT.get(ch.lower(), ch) for ch in word)
+    return out[:1].upper() + out[1:] if word[:1].isupper() else out
+
+
+def short_author(name: str) -> str:
+    """«Иванов Иван Иванович» → «Иванов И.О.»; already short / single-word / Latin names stay as typed."""
+    name = re.sub(r"\s+", " ", (name or "").strip())
+    parts = name.split(" ")
+    if len(parts) < 2 or any("." in p for p in parts[1:]) or not _has_cyrillic(name):
+        return name
+    return parts[0] + " " + "".join(p[0].upper() + "." for p in parts[1:3] if p)
+
+
+def _lat_author(name: str) -> str:
+    """«Козырев Д.» / «Иванов Иван Иванович» → «Kozyrev, D.» (initials separated by a space)."""
+    s = short_author(name)
+    if not _has_cyrillic(s):
+        return s
+    parts = s.split(" ", 1)
+    sur = translit(parts[0])
+    if len(parts) == 1:
+        return sur
+    inits = [translit(x[0]) + "." for x in re.findall(r"[^\W\d_]\.?", parts[1].replace(" ", ""))]
+    return sur + ", " + " ".join(inits)
+
+
+def _has_cyrillic(s: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", s or ""))
+
+
+def publication_authors_ru(r: dict) -> str:
+    """«Козырев Д., Поляков А., (10%) Одабашян М.»: owner and co-authors in author order,
+    surname + initials, the share in parentheses before the name."""
+    parts = []
+    for name, share in publication_authors(r):
+        if not (name or "").strip():
+            continue
+        parts.append((f"({_share_str(share)}) " if share is not None else "") + short_author(name))
+    return ", ".join(parts)
+
+
+def publication_authors_lat(r: dict) -> str:
+    """Authors in Latin as in the Scopus/WoS format: «A, B. C., D, E., & F, G.» - taken from
+    details.authors_lat when the member typed it, otherwise transliterated from the ФИО."""
+    typed = (r["details"].get("authors_lat") or "").strip()
+    if typed:
+        return typed.rstrip(" ,")
+    names = [_lat_author(n) for n, _ in publication_authors(r) if (n or "").strip()]
+    if len(names) > 1:
+        names[-1] = "& " + names[-1]
+    return ", ".join(names)
+
+
+def pub_year(r: dict) -> str:
+    d = r["details"]
+    return str(d.get("year") or (r["date_from"] or "")[:4] or "")
+
+
+def pub_date_text(r: dict) -> str:
+    """Full DD.MM.YYYY for records with a stored publication date, otherwise just the year."""
+    pd_ = r["details"].get("pub_date")
+    return fmt_date(pd_) if pd_ else pub_year(r)
+
+
+def _doi_url(doi: str) -> str:
+    d = normalize_doi(doi)
+    return f"https://doi.org/{d}" if d else ""
+
+
+# Rows printed in the «Scopus/WoS» format: ФИО (доля%) / латиницей, (год) Название. Журнал, ...
+_BIB_ROWS = ("I02.scopus", "I02.scopus_ar", "I02.vak", "I02.white")
+
+
+def _bib_has_title(bib: str, title: str) -> bool:
+    tn = normalize_title(title)
+    return bool(tn) and tn[:60] in normalize_title(bib)
+
+
+def _pub_tail(r: dict, line: str, with_link: bool = True) -> str:
+    """Append the link / DOI (if the text has none of them) and the portfolio number."""
     d = r["details"]
     num = r["number"] or ""
-    share = shares_text(r)
-    share = share[0].upper() + share[1:]
-    if (d.get("bib") or "").strip():
-        line = d["bib"].strip()
+    if with_link:
+        if r["link"] and r["link"].strip() not in line:
+            line += (", " if not line.endswith((".", ",")) else " ") + "ссылка: " + r["link"].strip()
+        doi = _doi_url(d.get("doi") or "")
+        if doi and normalize_doi(doi) not in line.lower():
+            line += " " + doi
+    if num and num not in line:
+        line += " " + num
+    return line
+
+
+def _share_sentence(r: dict) -> str:
+    t = shares_text(r)
+    return t[0].upper() + t[1:] + "."
+
+
+def _owner_in_text(r: dict, text_: str) -> bool:
+    """The record's main author (Cyrillic surname) is already named in a typed reference."""
+    sur = ((r.get("owner_name") or "").split() or [""])[0].lower()
+    return bool(sur) and sur in (text_ or "").lower()
+
+
+def publication_line_bibformat(r: dict) -> str:
+    """ВАК / Белый список / Scopus / WoS: «Авторы (рус) с долями / авторы латиницей, (год) Название.
+    Журнал, том(выпуск), стр., дата, ссылка: …, DOI-ссылка». A reference typed in «Библиографическая
+    ссылка» that contains the title is kept as is, with the Russian authors put in front (unless it
+    already names the main author in Russian). A link-only text in that field is appended to the
+    line built from the fields."""
+    d = r["details"]
+    bib = (d.get("bib") or "").strip()
+    typed_ru = (d.get("authors_text") or "").strip()
+    ru = typed_ru or publication_authors_ru(r)
+    if bib and _bib_has_title(bib, r["title"]):
+        if _owner_in_text(r, bib):
+            line = bib if "доля участия" in bib.lower() else bib.rstrip(" .") + ". " + _share_sentence(r)
+        else:
+            line = (ru.rstrip(" ,") + " " + bib).strip()
+            if typed_ru:
+                line = line.rstrip(" .") + ". " + _share_sentence(r)
+        return _pub_tail(r, line)
+    lat = publication_authors_lat(r)
+    head = " ".join(x for x in (ru.rstrip(" ,"), lat) if x)
+    if typed_ru:
+        head = head.rstrip(" .") + ". " + _share_sentence(r)
+    vol_issue = str(d.get("volume") or "").strip()
+    if str(d.get("issue") or "").strip():
+        vol_issue += f"({str(d['issue']).strip()})"
+    tail = [str(d.get("journal") or "").strip().rstrip(". "), vol_issue,
+            str(d.get("pages") or "").strip()]
+    body = f"({pub_year(r)}). {(r['title'] or '').strip().rstrip('. ')}."
+    line = " ".join(x for x in (head, body, ", ".join(x for x in tail if x)) if x)
+    if bib:  # link-only / free note typed in the bib field
+        note = ("ссылка: " + bib) if re.match(r"^https?://\S+$", bib) and bib != (r["link"] or "").strip() else bib
+        if bib not in line:
+            line = line.rstrip(",") + (" " if line.endswith((".", ",")) else ", ") + note
+    return _pub_tail(r, line)
+
+
+def publication_line(r: dict) -> str:
+    """Report line of an article. Scopus/WoS, ВАК and Белый список use the full bibliographic
+    format with the authors' ФИО and shares (publication_line_bibformat). Other rows keep the
+    older layout, but a typed reference without the main author's name gets the authors too."""
+    d = r["details"]
+    num = r["number"] or ""
+    bib = (d.get("bib") or "").strip()
+    if r.get("row_code") in _BIB_ROWS or (bib and not (_bib_has_title(bib, r["title"])
+                                                       and _owner_in_text(r, bib))):
+        return publication_line_bibformat(r)
+    share = _share_sentence(r)
+    if bib:
+        line = bib
         if "доля участия" not in line.lower():
-            line = line.rstrip(" .") + ". " + share + "."
+            line = line.rstrip(" .") + ". " + share
         if num and num not in line:
             line += " " + num
         return line
@@ -1392,12 +1599,12 @@ def publication_line(r: dict) -> str:
     parts = [authors.rstrip(". "), (r["title"] or "").strip().rstrip(". ")]
     if d.get("journal"):
         parts.append(str(d["journal"]).strip().rstrip(". "))
-    line = ". ".join(p for p in parts if p) + f". ({d.get('year') or (r['date_from'] or '')[:4]})."
+    line = ". ".join(p for p in parts if p) + f". ({pub_year(r)})."
     if r["link"]:
         line += " " + r["link"].strip()
     if d.get("doi"):
         line += f" DOI: {str(d['doi']).strip()}."
-    line += " " + share + "."
+    line += " " + share
     if num:
         line += " " + num
     return line

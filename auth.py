@@ -138,3 +138,32 @@ def user_from_token(token: str | None, db_path=None, now: float | None = None) -
     if not hmac.compare_digest(fp, _fingerprint(key, user["password_hash"])):
         return None
     return user
+
+
+# ── Admin «войти как участник» (impersonation) ───────────────────────────────
+# The session keeps TWO identities: st.session_state.user (the effective member, used for
+# every read/write) and st.session_state["_imp_admin"] (the real admin). The signed cookie is
+# never re-issued while impersonating, so it always carries the admin; a page refresh ends
+# the impersonation and returns to the admin.
+
+
+class ImpersonationError(PermissionError):
+    """Impersonation refused (not an admin / bad target)."""
+
+
+def impersonation_target(admin_id: int, target_id: int, db_path=None) -> dict:  # noqa: ANN001
+    """Checked on the server (DB), not from the UI: the acting user must be an ACTIVE admin
+    and the target an active, non-admin member other than himself. Returns the target row."""
+    from db import get_user_by_id
+
+    admin = get_user_by_id(int(admin_id), db_path=db_path)
+    if admin is None or not admin.get("active") or admin.get("role") != "admin":
+        raise ImpersonationError("Войти под другим участником может только админ.")
+    if int(target_id) == int(admin_id):
+        raise ImpersonationError("Это ваша собственная учётная запись.")
+    target = get_user_by_id(int(target_id), db_path=db_path)
+    if target is None or not target.get("active"):
+        raise ImpersonationError("Участник не найден или отключён.")
+    if target.get("role") == "admin":
+        raise ImpersonationError("Под другим админом входить нельзя - только под членами совета.")
+    return target

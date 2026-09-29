@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 
 import streamlit as st
@@ -33,7 +34,7 @@ def _engine():
 
 # Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
 # push without restarting the process, so a cached init would never re-run.
-SCHEMA_VERSION = "2026-09-28-coauthors"
+SCHEMA_VERSION = "2026-09-29-v4-pubdate"
 
 
 @st.cache_resource(show_spinner="Подключение к базе данных…")
@@ -83,6 +84,10 @@ def _ensure_session() -> None:
     elif st.session_state.user is not None:
         # Role/name/login changed by an admin take effect on the next rerun;
         # a deleted or disabled account is logged out.
+        imp = st.session_state.get("_imp_admin")
+        if imp is not None:
+            _refresh_impersonation(imp)
+            return
         fresh = db.get_user_by_id(st.session_state.user["id"])
         if fresh is None or not fresh.get("active"):
             st.session_state.user = None
@@ -90,6 +95,87 @@ def _ensure_session() -> None:
             _queue_auth_cookie(None)
         else:
             st.session_state.user = _session_user(fresh)
+
+
+# ── Admin: «войти как участник» ─────────────────────────────────────────────
+# st.session_state.user = the effective (impersonated) member: all reads and writes use it.
+# st.session_state["_imp_admin"] = the real admin, kept so «вернуться в админа» works. The
+# auth cookie is not touched while impersonating (it keeps the admin), so refreshing the
+# page returns to the admin.
+
+_VIEW_STATE_PREFIXES = ("p_", "ad_", "edit_", "confirm_", "mine_msg", "adm_a_msg", "btn_")
+
+
+def _reset_view_state() -> None:
+    """Forget form / edit state of the previous identity (widget keys are shared)."""
+    ss = st.session_state
+    for k in list(ss.keys()):
+        if isinstance(k, str) and (k.startswith(_VIEW_STATE_PREFIXES) or re.match(r"^e\d+_", k)):
+            del ss[k]
+
+
+def start_impersonation(target_id: int) -> bool:
+    ss = st.session_state
+    real = ss.get("_imp_admin") or ss.user
+    try:
+        target = auth.impersonation_target(real["id"], target_id)
+    except auth.ImpersonationError as exc:
+        ss["_imp_msg"] = ("error", str(exc))
+        return False
+    ss["_imp_admin"] = dict(real)
+    ss.user = _session_user(target)
+    _reset_view_state()
+    return True
+
+
+def stop_impersonation() -> None:
+    ss = st.session_state
+    admin = ss.pop("_imp_admin", None)
+    if admin is not None:
+        fresh = db.get_user_by_id(admin["id"])
+        if fresh is not None and fresh.get("active") and fresh.get("role") == "admin":
+            ss.user = _session_user(fresh)
+        else:
+            ss.user = None
+            ss["_cookie_logged_out"] = True
+            _queue_auth_cookie(None)
+    _reset_view_state()
+
+
+def _refresh_impersonation(admin: dict) -> None:
+    """Every rerun: the admin must still be an active admin, the member still active."""
+    ss = st.session_state
+    real = db.get_user_by_id(admin["id"])
+    if real is None or not real.get("active") or real.get("role") != "admin":
+        ss.pop("_imp_admin", None)
+        ss.user = None
+        ss["_cookie_logged_out"] = True
+        _queue_auth_cookie(None)
+        return
+    ss["_imp_admin"] = _session_user(real)
+    fresh = db.get_user_by_id(ss.user["id"])
+    if fresh is None or not fresh.get("active") or fresh.get("role") == "admin":
+        ss["_imp_msg"] = ("warning", "Участник больше недоступен - вы снова в роли админа.")
+        stop_impersonation()
+    else:
+        ss.user = _session_user(fresh)
+
+
+def _impersonate_cb(target_id: int) -> None:
+    start_impersonation(int(target_id))
+
+
+def render_impersonation_banner(user: dict) -> None:
+    """Shown on every page while an admin works as a member."""
+    admin = st.session_state.get("_imp_admin")
+    if admin is None:
+        return
+    c1, c2 = st.columns([5, 2], vertical_alignment="center")
+    c1.warning(f"Вы вошли как **{user['full_name']}** (@{user['login']}) - "
+               f"изменения записываются на этого участника. Ваша роль: админ ({admin['full_name']}).")
+    if c2.button("Вернуться в админа", type="primary", key="imp_return", width="stretch"):
+        stop_impersonation()
+        st.rerun()
 
 
 def _queue_auth_cookie(user_id: int | None) -> None:
@@ -117,6 +203,7 @@ def _apply_cookie_op() -> None:
 
 
 def logout() -> None:
+    st.session_state.pop("_imp_admin", None)  # full logout, also from «войти как»
     st.session_state.user = None
     st.session_state["_cookie_logged_out"] = True
     _queue_auth_cookie(None)
@@ -155,27 +242,80 @@ def render_login() -> None:
                     st.rerun()
 
 
+AUTO_REFRESH_SECONDS = 60
+
+
+@st.fragment(run_every=AUTO_REFRESH_SECONDS)
+def _auto_refresh() -> None:
+    """Every minute: one light query. If the data changed (another user / process wrote),
+    drop the shared caches and rerun the page - no manual reboot needed. Session state and
+    open forms are kept."""
+    ss = st.session_state
+    try:
+        stamp, version = db.data_stamp(), db.data_version()
+    except Exception:  # noqa: BLE001 - a hiccup must never break the page
+        return
+    seen, seen_version = ss.get("_data_stamp"), ss.get("_data_version")
+    ss["_data_stamp"], ss["_data_version"] = stamp, version
+    # data_version moved = a write made through this process (already invalidated the caches
+    # and visible to every session): only a change with NO local write means another process.
+    if seen is not None and seen != stamp and seen_version == version:
+        db.clear_cache()
+        st.rerun()
+
+
+def refresh_data() -> None:
+    """Admin button «Обновить данные»: drop every shared read cache and reload from the DB."""
+    db.clear_cache()
+    st.session_state.pop("_data_stamp", None)
+    st.session_state["_refresh_msg"] = "Данные обновлены из базы."
+
+
+def _password_form(user: dict) -> None:
+    with st.expander("🔑 Сменить пароль"):
+        with st.form("change_password_form", clear_on_submit=True):
+            current = st.text_input("Текущий пароль", type="password")
+            new = st.text_input(
+                f"Новый пароль (не менее {auth.MIN_PASSWORD_LENGTH} символов)",
+                type="password",
+            )
+            repeat = st.text_input("Повторите новый пароль", type="password")
+            if st.form_submit_button("Сменить пароль", width="stretch"):
+                ok, msg = auth.change_password(user["id"], current, new, repeat)
+                (st.success if ok else st.error)(msg)
+                if ok:  # old cookies are now invalid → fresh one for this browser
+                    _queue_auth_cookie(user["id"])
+
+
 def render_sidebar(user: dict) -> None:
+    impersonating = st.session_state.get("_imp_admin") is not None
     with st.sidebar:
         st.markdown(f"**{user['full_name']}**")
         role_label = "Лидер СНО (админ)" if user["role"] == "admin" else "Член совета"
         st.caption(f"{role_label} · @{user['login']}")
+        if impersonating:
+            st.caption("Режим «войти как участник»")
+            if st.button("Вернуться в админа", key="imp_return_sb", width="stretch"):
+                stop_impersonation()
+                st.rerun()
         if st.button("Выйти", width="stretch"):
             logout()
+        if user["role"] == "admin":
+            if st.button("Обновить данные", key="admin_refresh", width="stretch",
+                         icon=":material/refresh:",
+                         help="Сбросить кэш чтения и заново загрузить данные из базы. "
+                              "Обычно не нужно: данные обновляются сами (кэш живёт не дольше минуты)."):
+                refresh_data()
+                st.rerun()
+        msg = st.session_state.pop("_refresh_msg", None)
+        if msg:
+            st.success(msg)
         st.markdown("---")
-        with st.expander("🔑 Сменить пароль"):
-            with st.form("change_password_form", clear_on_submit=True):
-                current = st.text_input("Текущий пароль", type="password")
-                new = st.text_input(
-                    f"Новый пароль (не менее {auth.MIN_PASSWORD_LENGTH} символов)",
-                    type="password",
-                )
-                repeat = st.text_input("Повторите новый пароль", type="password")
-                if st.form_submit_button("Сменить пароль", width="stretch"):
-                    ok, msg = auth.change_password(user["id"], current, new, repeat)
-                    (st.success if ok else st.error)(msg)
-                    if ok:  # old cookies are now invalid → fresh one for this browser
-                        _queue_auth_cookie(user["id"])
+        if impersonating:
+            # a password change would re-issue the auth cookie for the member: not allowed here
+            st.caption("Пароль меняет сам участник.")
+        else:
+            _password_form(user)
         st.caption(f"База данных: {db.backend_name()}")
 
 
@@ -261,6 +401,20 @@ def admin_members(user: dict) -> None:
     users = db.list_users()
     st.markdown(f"**Всего:** {len(users)}")
 
+    imp_opts = {u["id"]: f"{u['full_name']} (@{u['login']})" for u in users
+                if u["active"] and u["role"] == "member" and u["id"] != user["id"]}
+    if imp_opts:
+        with st.container(border=True):
+            st.markdown("**Войти как участник**")
+            st.caption("Увидите сайт глазами участника и сможете вносить данные за него. "
+                       "В любой момент - кнопка «Вернуться в админа».")
+            i1, i2 = st.columns([4, 2], vertical_alignment="bottom")
+            pick = i1.selectbox("Участник", list(imp_opts), format_func=imp_opts.get, key="imp_pick",
+                                label_visibility="collapsed")
+            i2.button("Войти как участник", key="imp_go", width="stretch",
+                      on_click=lambda: _impersonate_cb(st.session_state.get("imp_pick") or pick))
+            _show_msgs("_imp_msg")
+
     for u in users:
         active_mark = "✅" if u["active"] else "⛔"
         role_ru = "админ" if u["role"] == "admin" else "член совета"
@@ -307,6 +461,9 @@ def admin_members(user: dict) -> None:
                     else:
                         st.session_state[f"confirm_del_u_{u['id']}"] = True
 
+            if u["active"] and u["role"] == "member" and u["id"] != user["id"]:
+                st.button("Войти как этот участник", key=f"imp_go_{u['id']}",
+                          on_click=_impersonate_cb, args=(u["id"],))
             _show_msgs(f"user_msg_{u['id']}")
             role_key = f"confirm_role_{u['id']}"
             if st.session_state.get(role_key):
@@ -861,6 +1018,8 @@ def main() -> None:
     else:
         brand.compact_header(brand.sno_name(db))
         render_sidebar(user)
+        render_impersonation_banner(user)
+        _auto_refresh()
         if user["role"] == "admin":
             admin_panel(user)
         else:
