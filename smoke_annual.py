@@ -691,6 +691,41 @@ def run_v4_refresh(target) -> None:  # noqa: ANN001
     print("  refresh: admin cache reset, 60 s TTL, other-process writes detected by data_stamp (1 query) OK")
 
 
+def run_v4_org_toggle(target) -> None:  # noqa: ANN001
+    """Kind «Организация научного мероприятия»: admin can let members add it; other admin kinds stay locked."""
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    m = db.create_user("org_m", "pass12345", "Организаторов О.О.", db_path=target)
+    member = db.get_user_by_id(m, db_path=target)
+    org = ach.kind_by_code("org_sci", target)
+    cat = ach.catalog(target)
+    ind = next(i for i in cat if i["id"] == org["indicator_id"])
+    data = {"kind_id": org["id"], "title": "Конференция СНО", "date_from": "2026-05-01",
+            "row_id": ind["rows"][0]["id"]}
+    assert org["admin_only"] == 1
+    assert all(k["code"] != "org_sci" for k in ach.list_kinds(target))
+    try:
+        ach.save_achievement(data, member, db_path=target)
+        raise AssertionError("locked by default")
+    except ValueError as e:
+        assert "только админ" in str(e)
+    ach.set_kind_admin_only(org["id"], False, db_path=target)
+    assert any(k["code"] == "org_sci" for k in ach.list_kinds(target))
+    aid = ach.save_achievement(data, member, db_path=target)["id"]
+    assert ach.get_achievement(aid, target)["owner_id"] == m
+    # other admin kinds cannot be unlocked through this function
+    ag = ach.kind_by_code("agreement", target)
+    try:
+        ach.set_kind_admin_only(ag["id"], False, db_path=target)
+        raise AssertionError("agreement must stay admin-only")
+    except ValueError:
+        pass
+    ach.set_kind_admin_only(org["id"], True, db_path=target)
+    assert all(k["code"] != "org_sci" for k in ach.list_kinds(target))
+    assert ach.get_achievement(aid, target) is not None  # existing record untouched
+    print("  org_sci admin-only toggle OK")
+
+
 def run_v4_impersonation(target) -> None:  # noqa: ANN001
     """Item 3: server-side rules + full UI flow through Streamlit AppTest (cookie keeps the admin)."""
     db.init_db(db_path=target, seed_admin=True)
@@ -817,3 +852,4 @@ def run_all(target, fresh) -> None:  # noqa: ANN001
     run_v4_bibformat(fresh())
     run_v4_refresh(fresh())
     run_v4_impersonation(fresh())
+    run_v4_org_toggle(fresh())

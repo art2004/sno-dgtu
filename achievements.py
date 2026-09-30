@@ -685,6 +685,20 @@ def _move(table: str, item_id: int, direction: int, parent: Optional[int], db_pa
             conn.execute(text(f"UPDATE {table} SET sort_order = :p WHERE id = :id"), {"p": pos * 10, "id": iid})
 
 
+# Виды, для которых админ может менять флаг «только админ» из интерфейса.
+ADMIN_ONLY_TOGGLEABLE = {"org_sci"}
+
+
+def set_kind_admin_only(kind_id: int, admin_only: bool, db_path: DbTarget = None) -> None:
+    """Toggle «только админ» for a kind from ADMIN_ONLY_TOGGLEABLE. Old records stay untouched."""
+    kind = get_kind(kind_id, db_path)
+    if kind is None or kind["code"] not in ADMIN_ONLY_TOGGLEABLE:
+        raise ValueError("Для этого вида флаг «только админ» менять нельзя")
+    with _eng(db_path).begin() as conn:
+        conn.execute(text("UPDATE kinds SET admin_only = :a WHERE id = :id"),
+                     {"a": int(bool(admin_only)), "id": kind_id})
+
+
 def rename_kind(kind_id: int, label: str, hidden: bool, db_path: DbTarget = None) -> None:
     label = (label or "").strip()
     if not label:

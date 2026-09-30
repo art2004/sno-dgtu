@@ -654,10 +654,19 @@ def catalog_editor() -> None:
                                                 "подпункты" if k["subpoints"] else "")} for k in kinds])
         ked = st.data_editor(kdf, hide_index=True, width="stretch", key="cat_kinds",
                              disabled=["id", "Только админ", "Показатель"], column_config={"id": None})
+        org = next((k for k in kinds if k["code"] == "org_sci"), None)
+        org_allow = None
+        if org is not None:
+            org_allow = st.checkbox(
+                f"Участники сами вносят «{org['label']}»", value=not org["admin_only"], key="cat_org_allow",
+                help="Если включено, вид виден в форме всем участникам, запись принадлежит внёсшему её участнику. "
+                     "Уже внесённые записи не меняются. Остальные админские виды остаются только за админом.")
         if st.button("Сохранить виды", key="cat_kinds_save"):
             try:
                 for rec in ked.to_dict("records"):
                     ach.rename_kind(int(rec["id"]), rec["Вид"], bool(rec["Скрыт"]))
+                if org is not None and org_allow is not None:
+                    ach.set_kind_admin_only(int(org["id"]), not org_allow)
                 st.session_state["cat_msg"] = ("success", "Виды сохранены.")
             except ValueError as e:
                 st.session_state["cat_msg"] = ("error", str(e))
