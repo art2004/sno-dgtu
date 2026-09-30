@@ -701,7 +701,7 @@ def run_v4_org_toggle(target) -> None:  # noqa: ANN001
     cat = ach.catalog(target)
     ind = next(i for i in cat if i["id"] == org["indicator_id"])
     data = {"kind_id": org["id"], "title": "Конференция СНО", "date_from": "2026-05-01",
-            "row_id": ind["rows"][0]["id"]}
+            "row_id": ind["rows"][0]["id"], "number": "Р-Н-12345"}
     assert org["admin_only"] == 1
     assert all(k["code"] != "org_sci" for k in ach.list_kinds(target))
     try:
@@ -713,6 +713,9 @@ def run_v4_org_toggle(target) -> None:  # noqa: ANN001
     assert any(k["code"] == "org_sci" for k in ach.list_kinds(target))
     aid = ach.save_achievement(data, member, db_path=target)["id"]
     assert ach.get_achievement(aid, target)["owner_id"] == m
+    assert ach.get_achievement(aid, target)["number"] == "Р-Н-12345"
+    line = ach.record_line(ach.get_achievement(aid, target))
+    assert "Р-Н-12345" in line and "Организаторов О.О." in line, line
     # other admin kinds cannot be unlocked through this function
     ag = ach.kind_by_code("agreement", target)
     try:

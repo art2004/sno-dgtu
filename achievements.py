@@ -270,7 +270,7 @@ FORMS: dict[str, list[tuple]] = {
         ("order_date", "Дата приказа", "date_opt", False, {}),
         ("order_subject", "Содержание приказа («Об организации …»)", "text", False, {}),
         ("people", "Участники-организаторы", "people", False, {}),
-        ("link", "Ссылка на подтверждение", "text", False, {}),
+        *_TAIL,
     ],
     "sno_contest": [
         ("title", "Конкурс", "text", True, {}),
@@ -1652,7 +1652,7 @@ def record_line(r: dict, sno_name: str = "") -> str:
         if d.get("order_no") or d.get("order_date"):
             order = ("приказ" + (f" от {fmt_date(d.get('order_date'))}" if d.get("order_date") else "")
                      + (f", №{d['order_no']}" if d.get("order_no") else ""))
-        return _join([fmt_date(r["date_from"]), r["title"], order, d.get("order_subject") or ""])
+        return _join([fmt_date(r["date_from"]), r["title"], order, d.get("order_subject") or "", *names, num])
     if f == "sno_contest":
         return _join([r["title"], _period(r), *names, d.get("result") or "",
                       f"СНО «{sno_name}»" if sno_name else "", num])
