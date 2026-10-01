@@ -1,0 +1,49 @@
+name: keepalive
+
+# Не даёт Streamlit Community Cloud усыпить сайт СНО: раз в ~6 часов открывает его настоящим
+# браузером (Playwright) и, если видит экран «This app has gone to sleep», нажимает кнопку пробуждения.
+# Запуск вручную: Actions -> keepalive -> Run workflow. Секреты не нужны.
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # 4 раза в сутки (UTC); минута 17 - чтобы не попадать в пик нагрузки GitHub
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Адрес сайта (по умолчанию из scripts/keepalive.py)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright + Chromium
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+      - name: Open the site in a real browser (wakes it if asleep)
+        env:
+          SITE_URL: ${{ inputs.url }}
+        run: |
+          if [ -z "$SITE_URL" ]; then unset SITE_URL; fi
+          python scripts/keepalive.py
+      - name: Upload screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-fail
+          path: keepalive-fail.png
+          if-no-files-found: ignore
