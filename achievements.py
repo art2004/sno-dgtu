@@ -154,7 +154,7 @@ _TAIL = [("number", "Номер достижения (Р-Н-…, с сайта �
 CONTEST_RESULTS = ("участие", "диплом", "призёр", "лауреат")
 NO_INDEX = -2  # публикация «Без индексации»: валидная запись, в годовой отчёт не входит
 NO_INDEX_LABEL = "без индексации (в годовой отчёт не входит)"
-GRANT_STATUSES = ("подана", "поддержана")
+GRANT_STATUSES = ("подана", "поддержана", "не поддержана")
 FUND_SOURCES = ("бюджет", "внебюджет")
 
 FORMS: dict[str, list[tuple]] = {
@@ -303,7 +303,7 @@ NUMBER_MAX_LEN = 64
 # Номер достижения (портфолио) нужен для попадания записи в годовой отчёт у всех видов, кроме:
 #  * agreement (Соглашение с партнёром) - в форме вообще нет поля «номер»;
 #  * sno_contest (Конкурс оценки СНО), funded (Финансируемая работа) - записи самого СНО, не личные
-#    достижения участника (админский учёт; ВОПРОС ПОЛЬЗОВАТЕЛЮ - см. отчёт);
+#    достижения участника (админский учёт; решение пользователя: номер не нужен);
 #  * любой записи без владельца (админская запись «СНО в целом» - личного портфолио нет).
 # Организация мероприятий (org_sci, org_pop): у записи с участником-организатором номер нужен.
 NUMBER_EXEMPT_KINDS = frozenset({"agreement", "sno_contest", "funded"})
@@ -1435,7 +1435,8 @@ _OWN_MESSAGE_FIELDS = {"publication": ("journal",), "stipend": ("ayear",), "dokl
 
 
 def _gaps(r: dict) -> list[tuple[bool, str]]:
-    """Все недочёты записи: (блокирует ли отчёт, текст). Блокирующие -> is_counted = False."""
+    """Все недочёты записи: (блокирует ли отчёт, текст). Блокирующие -> is_counted = False.
+    Не блокируют только: «проверьте главного автора» (перенесённые записи) и повтор номера."""
     out: list[tuple[bool, str]] = []
     d = r["details"]
     if r["kind_form"] == "grant" and not r["subpoint_id"]:
@@ -1454,15 +1455,15 @@ def _gaps(r: dict) -> list[tuple[bool, str]]:
                     "в отчёт идёт один раз, эту запись лучше удалить"))
     if r["form"] == "publication":
         if r["owner_share"] is None or any(p["share"] is None for p in r["people"]):
-            out.append((False, "заполните долю"))
+            out.append((True, "заполните долю"))
         if not d.get("journal") and not d.get("bib"):
-            out.append((False, "заполните журнал"))
+            out.append((True, "заполните журнал"))
         if d.get("legacy_coauthors") and r["owner_share"] is None:
             out.append((False, "проверьте главного автора (перенесено: первый добавивший)"))
     if r["form"] == "doklad" and not (r["topic"] or "").strip():
         out.append((True, "заполните тему доклада"))  # строка отчёта «доклад на тему: «»» без темы пуста
     if r["form"] == "stipend" and not re.match(r"^\d{4}-\d{4}$", str(d.get("ayear") or "")):
-        out.append((False, "укажите учебный год"))
+        out.append((True, "укажите учебный год"))
     if r.get("dup_number"):
         out.append((False, f"этот номер достижения уже указан в другой записи ({r['dup_number']}) - "
                     "проверьте, не внесено ли одно достижение дважды"))
@@ -1497,7 +1498,7 @@ def is_counted(r: dict) -> bool:
 
 def record_issues(r: dict) -> list[str]:
     """What the owner/admin still has to fill («заполните …»). Часть блокирует отчёт
-    (см. _gaps), остальное - предупреждения (доли, журнал, учебный год)."""
+    (см. _gaps: в т.ч. доли, журнал, учебный год), остальное - только предупреждения."""
     return [msg for _, msg in _gaps(r)]
 
 

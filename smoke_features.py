@@ -356,7 +356,7 @@ def run_report_gate(target) -> None:  # noqa: ANN001
     broken("ip", "details = '{}'", "Номер документа")               # номер документа/заявки
     broken("grant.app", "details = '{\"project\": \"П\"}'", "Статус заявки")       # статус заявки
     broken("grant.app", "details = '{\"status\": \"подана\"}'", "Название проекта")  # проект
-    broken("grant.app", "details = '{\"project\": \"П\", \"status\": \"не поддержана\"}'", "Статус заявки")
+    broken("grant.app", "details = '{\"project\": \"П\", \"status\": \"отклонена\"}'", "Статус заявки")  # вне списка
     broken("funded", "details = '{}'", "Источник")                  # источник
     broken("agreement", "details = '{}'", "Номер и дата соглашения")
     broken("publication", "title = ''", "пустые поля")
@@ -386,14 +386,36 @@ def run_report_gate(target) -> None:  # noqa: ANN001
             raise AssertionError(bad)
         except ValueError as e:
             assert needle in str(e), str(e)
-    # публикация без доли и без журнала: остаётся в отчёте с предупреждением (мягкое правило)
+    # публикация без доли / без журнала и стипендия без учебного года: БЛОКИРУЮТ отчёт (is_counted=False + предупреждение)
     pid = ach.save_achievement({**ids["publication"][1], "title": "Без журнала", "number": "Р-Н-950-26",
                                 "owner_share": 100}, admin, db_path=target)["id"]
-    with db.get_engine(target).begin() as conn:
-        conn.execute(text("UPDATE achievements SET details = '{\"year\": 2026}' WHERE id = :i"), {"i": pid})
-    db.clear_cache()
-    p = ach.get_achievement(pid, target)
-    assert p["counted"] and any("журнал" in i for i in p["issues"])
+    sid = ach.save_achievement({**ids["stipend"][1], "title": "Без года", "number": "Р-Н-951-26"},
+                               admin, db_path=target)["id"]
+    for rid, patch, needle in (
+            (pid, "details = '{\"year\": 2026}'", "журнал"),
+            (pid, "owner_share = NULL", "долю"),
+            (sid, "details = '{}'", "учебный год")):
+        with db.get_engine(target).begin() as conn:
+            old = dict(conn.execute(text("SELECT * FROM achievements WHERE id = :i"), {"i": rid}).mappings().one())
+            conn.execute(text(f"UPDATE achievements SET {patch} WHERE id = :i"), {"i": rid})
+        db.clear_cache()
+        r = ach.get_achievement(rid, target)
+        assert not r["counted"] and any(needle in i for i in r["issues"]), (patch, r["issues"])
+        assert rid in {w["id"] for w in ach.report_data(2026, db_path=target)["warnings"]}
+        assert rid not in {x["id"] for i in ach.report_data(2026, db_path=target)["indicators"]
+                           for x in [*i["records"], *[y for row in i["rows"] for y in row["records"]]]}
+        assert rid in {x["id"] for x in todo.list_todo(year=2026, db_path=target)}
+        with db.get_engine(target).begin() as conn:
+            conn.execute(text("UPDATE achievements SET details = :d, owner_share = :s WHERE id = :i"),
+                         {"d": old["details"], "s": old["owner_share"], "i": rid})
+        db.clear_cache()
+        assert ach.get_achievement(rid, target)["counted"], patch
+    # статус заявки на грант «не поддержана» допустим, запись идёт в отчёт, в строке отчёта виден статус
+    ga = ach.save_achievement({**ids["grant.app"][1], "title": "Заявка отклонена", "status": "не поддержана",
+                               "number": "Р-Н-952-26"}, admin, db_path=target)
+    assert ga["counted"] and not ga["issues"], ga
+    assert "заявка не поддержана" in ach.record_line(ach.get_achievement(ga["id"], target)), "строка отчёта"
+    assert "не поддержана" in ach.GRANT_STATUSES and "поддержана" in ach.GRANT_STATUSES
     # «Мои достижения»: save_achievement сообщает, считается ли запись
     assert ach.save_achievement({**ids["edu"][1], "title": "Без номера 2"}, admin, db_path=target)["counted"] is False
     print(f"  report gate OK ({len(cases)} видов/подпунктов: без номера не считается и даёт предупреждение; "
