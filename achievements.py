@@ -26,6 +26,7 @@ from typing import Any, Optional
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
+import audit
 import db
 from db import DbTarget, _insert_returning_id, _now, _one, _rows, get_engine, normalize_title
 
@@ -926,11 +927,13 @@ def _apply_pub_date(data: dict, old: Optional[dict], vals: dict, details: dict, 
 
 
 def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int] = None,
-                     db_path: DbTarget = None) -> dict:
+                     db_path: DbTarget = None, audit_ctx: Optional[dict] = None) -> dict:
     """Create/update a record. data keys: kind_id, subpoint_id, row_id, owner_id, fields
     by FORMS (title, date_from, …), members [user ids], externals, owner_share,
     coauthors [{user_id, name, share}], main_pos, meeting_id.
     Members save only their own records (owner = themselves) of member kinds.
+    audit_ctx = {"actor": real user, "as_user": impersonated member} for the audit log (UI passes
+    audit.who(session_state)); by default the actor is acting_user.
     Raises ValueError (validation) / DuplicateAchievement."""
     is_admin = acting_user.get("role") == "admin"
     kind = get_kind(int(data.get("kind_id") or 0), db_path)
@@ -1085,7 +1088,68 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
         if old_event and old_event != row["event_id"]:
             db._delete_orphans(conn, [int(old_event)])
     rec = get_achievement(aid, db_path)
+    _audit_save(rec, old, acting_user, audit_ctx, db_path)
     return {"id": aid, "issues": rec["issues"] if rec else []}
+
+
+# ── Audit log hooks (журнал действий; сбой журнала не ломает сохранение) ─────
+
+
+def audit_snapshot(r: dict) -> dict:
+    """Читаемый снимок ключевых полей записи: {подпись: значение} (для «было / стало»)."""
+    snap: dict[str, Any] = {
+        "Вид": r["kind_label"],
+        "Подпункт гранта": r.get("subpoint_label") or "",
+        "Показатель": (r.get("indicator_label") or "").strip()[:60],
+        "Уровень / подпункт": strip_dash(r.get("row_label") or ""),
+        "Участник": r.get("owner_name") or "СНО",
+        "Название": r["title"],
+        "Дата с": fmt_date(r["date_from"]),
+        "Дата по": fmt_date(r["date_to"]),
+        "Тема": r.get("topic") or "",
+        "Номер в портфолио": r.get("number") or "",
+        "Ссылка": r.get("link") or "",
+    }
+    if r["form"] == "doklad":
+        snap["Очно"] = "да" if r["ochno"] else "нет"
+    if r["form"] == "publication":
+        snap["Доля главного автора"] = _share_str(r["owner_share"]) if r["owner_share"] is not None else ""
+        snap["Соавторы"] = "; ".join(f"{p['name']} ({_share_str(p['share'])})" for p in r["people"] if p["name"])
+    else:
+        snap["Участники"] = ", ".join(people_names(r, with_owner=False))
+    for key, label, ftype, _req, _extra in FORMS.get(r["form"], []):
+        if ftype in ("people", "authors", "meeting", "date", "date_opt", "pubdate", "ayear", "year", "check") \
+                or key in _COLUMNS:
+            continue
+        snap[label.split(" (")[0]] = r["details"].get(key) or ""
+    if r["form"] == "publication":
+        snap["Дата публикации"] = r["details"].get("pub_date") or r["details"].get("year") or ""
+    if r["form"] == "stipend":
+        snap["Учебный год"] = r["details"].get("ayear") or ""
+    return snap
+
+
+def _audit_save(rec: Optional[dict], old: Optional[dict], acting_user: dict, ctx: Optional[dict],
+                db_path: DbTarget) -> None:
+    if rec is None:
+        return
+    try:
+        ctx = ctx or {"actor": acting_user, "as_user": None}
+        target = {"id": rec["owner_id"], "full_name": rec.get("owner_name")} if rec["owner_id"] else None
+        head = f"{rec['kind_label']} «{audit._short(rec['title'])}»"
+        snap = audit_snapshot(rec)
+        if old is None:
+            audit.log("achievement_create", ctx.get("actor"), ctx.get("as_user"), target, "achievement", rec["id"],
+                      f"Создано: {head}; владелец: {snap['Участник']}; дата: {snap['Дата с'] or '-'}",
+                      {"after": audit._clip(snap), "issues": rec["issues"]}, db_path)
+            return
+        changes = audit.diff_fields(audit_snapshot(old), snap)
+        text_ = audit.describe_changes(changes) if changes else "поля не менялись"
+        audit.log("achievement_update", ctx.get("actor"), ctx.get("as_user"), target, "achievement", rec["id"],
+                  f"Изменено: {head}. {text_}", {"changes": changes}, db_path)
+    except Exception as exc:  # noqa: BLE001 - журнал не должен ломать сохранение
+        import sys
+        print(f"audit hook failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
 
 
 def _event_for(conn, kind_code: str, title: str, date_from: Optional[str]) -> Optional[int]:  # noqa: ANN001
@@ -1101,9 +1165,33 @@ def _event_for(conn, kind_code: str, title: str, date_from: Optional[str]) -> Op
               "VALUES (:title, :tn, :t, :d, :now)", {**key, "title": title.strip(), "now": _now()})
 
 
-def delete_achievement(achievement_id: int, owner_id: Optional[int] = None, db_path: DbTarget = None) -> bool:
+def delete_achievement(achievement_id: int, owner_id: Optional[int] = None, db_path: DbTarget = None,
+                       audit_ctx: Optional[dict] = None) -> bool:
     """Delete a record (owner_id → only own). Its legacy participation(s) go too, and the
-    event is removed when nothing references it any more (meetings keep their row)."""
+    event is removed when nothing references it any more (meetings keep their row).
+    audit_ctx: see save_achievement (UI passes audit.who(session_state))."""
+    try:
+        before = get_achievement.uncached(achievement_id, db_path)
+    except Exception:  # noqa: BLE001
+        before = None
+    done = _delete_achievement(achievement_id, owner_id, db_path)
+    if done and before is not None:
+        try:
+            ctx = audit_ctx or {}
+            snap = audit_snapshot(before)
+            target = {"id": before["owner_id"], "full_name": before.get("owner_name")} if before["owner_id"] else None
+            audit.log("achievement_delete", ctx.get("actor"), ctx.get("as_user"), target, "achievement",
+                      achievement_id,
+                      f"Удалено: {before['kind_label']} «{audit._short(before['title'])}»; "
+                      f"владелец: {snap['Участник']}; дата: {snap['Дата с'] or '-'}",
+                      {"before": audit._clip(snap)}, db_path)
+        except Exception as exc:  # noqa: BLE001
+            import sys
+            print(f"audit hook failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    return done
+
+
+def _delete_achievement(achievement_id: int, owner_id: Optional[int], db_path: DbTarget) -> bool:
     with _eng(db_path).begin() as conn:
         a = _one(conn.execute(text("SELECT id, owner_id, event_id, legacy_pid FROM achievements WHERE id = :id"),
                               {"id": achievement_id}))

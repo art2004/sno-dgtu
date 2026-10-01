@@ -10,7 +10,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+import audit
 import auth
+import backup
 import brand
 import db
 import report
@@ -34,7 +36,7 @@ def _engine():
 
 # Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
 # push without restarting the process, so a cached init would never re-run.
-SCHEMA_VERSION = "2026-09-29-v4-pubdate"
+SCHEMA_VERSION = "2026-10-01-v5-audit-log"
 
 
 @st.cache_resource(show_spinner="Подключение к базе данных…")
@@ -103,14 +105,14 @@ def _ensure_session() -> None:
 # auth cookie is not touched while impersonating (it keeps the admin), so refreshing the
 # page returns to the admin.
 
-_VIEW_STATE_PREFIXES = ("p_", "ad_", "edit_", "confirm_", "mine_msg", "adm_a_msg", "btn_")
+_VIEW_STATE_PREFIXES = ("p_", "ad_", "edit_", "confirm_", "mine_msg", "adm_a_msg", "btn_", "td_open", "td_msg")
 
 
 def _reset_view_state() -> None:
     """Forget form / edit state of the previous identity (widget keys are shared)."""
     ss = st.session_state
     for k in list(ss.keys()):
-        if isinstance(k, str) and (k.startswith(_VIEW_STATE_PREFIXES) or re.match(r"^e\d+_", k)):
+        if isinstance(k, str) and (k.startswith(_VIEW_STATE_PREFIXES) or re.match(r"^(e|td)\d+_", k)):
             del ss[k]
 
 
@@ -125,6 +127,8 @@ def start_impersonation(target_id: int) -> bool:
     ss["_imp_admin"] = dict(real)
     ss.user = _session_user(target)
     _reset_view_state()
+    audit.log("impersonate_start", actor=real, as_user=target, target_user=target, entity="user",
+              entity_id=target["id"], summary=f"Админ {real['full_name']} вошёл как участник {target['full_name']}")
     return True
 
 
@@ -132,6 +136,11 @@ def stop_impersonation() -> None:
     ss = st.session_state
     admin = ss.pop("_imp_admin", None)
     if admin is not None:
+        member = ss.get("user")
+        if member:
+            audit.log("impersonate_stop", actor=admin, as_user=member, target_user=member, entity="user",
+                      entity_id=member["id"],
+                      summary=f"Админ {admin['full_name']} вернулся из режима «{member['full_name']}»")
         fresh = db.get_user_by_id(admin["id"])
         if fresh is not None and fresh.get("active") and fresh.get("role") == "admin":
             ss.user = _session_user(fresh)
@@ -238,6 +247,8 @@ def render_login() -> None:
                 else:
                     st.session_state.user = _session_user(user)
                     st.session_state.pop("_cookie_logged_out", None)
+                    audit.log("login", actor=user, entity="user", entity_id=user["id"],
+                              summary=f"Вход: {user['full_name']} (@{user['login']})")
                     _queue_auth_cookie(user["id"])
                     st.rerun()
 
@@ -357,6 +368,24 @@ def _role_label(role: str) -> str:
     return "Член совета" if role == "member" else "Админ"
 
 
+def _audit_user_update(u: dict, acting: dict, fields: dict) -> None:
+    """Журнал: что изменили у участника (пароль - только факт смены, без значения и хэша)."""
+    before = {"ФИО": u["full_name"], "Логин": u["login"], "Активен": "да" if u["active"] else "нет",
+              "Роль": _role_label(u["role"]).lower()}
+    after = {"ФИО": (fields.get("full_name") or u["full_name"]).strip(),
+             "Логин": (fields.get("login") or u["login"]).strip(),
+             "Активен": ("да" if fields["active"] else "нет") if fields.get("active") is not None else before["Активен"],
+             "Роль": _role_label(fields["role"]).lower() if fields.get("role") else before["Роль"]}
+    changes = audit.diff_fields(before, after)
+    if fields.get("password"):
+        changes.append({"field": "Пароль", "before": "", "after": "изменён"})
+    if not changes:
+        return
+    audit.log_ui(st.session_state, "user_update", target_user=u, entity="user", entity_id=u["id"],
+                 summary=f"Участник {u['full_name']}: " + audit.describe_changes(changes).replace("было (пусто), ", ""),
+                 details={"changes": changes})
+
+
 def _save_user(u: dict, acting: dict, fields: dict) -> None:
     """update_user with db-level admin safeguards; messages via session_state."""
     try:
@@ -369,6 +398,7 @@ def _save_user(u: dict, acting: dict, fields: dict) -> None:
         return
     if u["id"] == acting["id"] and fields.get("password"):
         _queue_auth_cookie(acting["id"])  # keep own login
+    _audit_user_update(u, acting, fields)
     msg = "Сохранено."
     if fields.get("role") and fields["role"] != u["role"]:
         msg += f" Роль: {_role_label(fields['role']).lower()} (применится при следующем действии пользователя)."
@@ -389,7 +419,11 @@ def admin_members(user: dict) -> None:
                     st.error("Заполните ФИО, логин и пароль.")
                 else:
                     try:
-                        db.create_user(login.strip(), password, full_name.strip(), role)
+                        new_id = db.create_user(login.strip(), password, full_name.strip(), role)
+                        audit.log_ui(st.session_state, "user_create", entity="user", entity_id=new_id,
+                                     target_user={"id": new_id, "full_name": full_name.strip()},
+                                     summary=f"Создан участник {full_name.strip()} (@{login.strip()}), "
+                                             f"роль: {_role_label(role).lower()}")
                         st.success(f"Участник «{full_name.strip()}» создан.")
                         st.rerun()
                     except db.DuplicateError:
@@ -489,6 +523,9 @@ def admin_members(user: dict) -> None:
                     st.session_state.pop(confirm_key, None)
                     try:
                         db.delete_user(u["id"], acting_user_id=user["id"])
+                        audit.log_ui(st.session_state, "user_delete", entity="user", entity_id=u["id"],
+                                     target_user=u,
+                                     summary=f"Удалён участник {u['full_name']} (@{u['login']}) со всеми записями")
                     except ValueError as e:  # last active admin / yourself
                         st.session_state[f"user_msg_{u['id']}"] = ("error", str(e))
                     st.rerun()
@@ -531,6 +568,10 @@ def _import_members_ui() -> None:
     if st.button(label, type="primary", key="import_go"):
         with st.spinner("Создаю учётные записи…"):
             created, skipped = db.import_members(rows)
+        audit.log_ui(st.session_state, "import_members", entity="users",
+                     summary=f"Импорт участников из Excel «{up.name}»: создано {created}, пропущено {skipped}",
+                     details={"file": up.name, "rows": len(rows), "created": created, "skipped": skipped,
+                              "logins": [r["login"] for r in rows if r.get("ok")][:200]})
         st.session_state["import_msg"] = (
             "success", f"Импорт завершён: создано {created}, пропущено {skipped}."
         )
@@ -765,6 +806,7 @@ def admin_meetings() -> None:
                     else:
                         try:
                             db.update_meeting(mid, e_date, e_time, e_loc, e_topic, fmt, kind=e_kind)
+                            _audit_meeting_update(m, e_date, e_time, e_loc, e_topic, fmt, e_kind)
                             st.success("Сохранено.")
                             st.rerun()
                         except ValueError as e:
@@ -778,6 +820,9 @@ def admin_meetings() -> None:
                 b1, b2, _ = st.columns([1, 1, 4])
                 if b1.button("Да, удалить", key=f"yes_m_{mid}", type="primary"):
                     db.delete_meeting(mid)
+                    audit.log_ui(ss, "meeting_delete", entity="meeting", entity_id=mid,
+                                 summary=f"Удалено заседание/мероприятие от {_fmt_date(m['meeting_date'])}: "
+                                         f"{audit.show(m['topic'])}")
                     ss.pop(confirm_key, None)
                     st.rerun()
                 if b2.button("Отмена", key=f"no_m_{mid}"):
@@ -797,6 +842,18 @@ _MF_DEFAULTS = {
     "mf_event_id": None,
     "mf_from_event": None,
 }
+
+
+def _audit_meeting_update(m: dict, e_date, e_time, e_loc, e_topic, fmt, e_kind) -> None:
+    before = {"Дата": _fmt_date(m["meeting_date"]), "Время": m["meeting_time"], "Вид": m["kind"],
+              "Локация": m["location"], "Тема": m["topic"], "Формат": m["format"]}
+    after = {"Дата": _fmt_date(db._to_date(e_date)), "Время": db.normalize_time(e_time), "Вид": e_kind,
+             "Локация": (e_loc or "").strip(), "Тема": (e_topic or "").strip(), "Формат": fmt}
+    changes = audit.diff_fields(before, after)
+    if changes:
+        audit.log_ui(st.session_state, "meeting_update", entity="meeting", entity_id=m["id"],
+                     summary=f"Заседание/мероприятие от {before['Дата']}: " + audit.describe_changes(changes),
+                     details={"changes": changes})
 
 
 def _mf_reset() -> None:
@@ -839,8 +896,10 @@ def _submit_meeting() -> None:
         return
     try:
         d = ss.get("mf_date") or date.today()
-        db.add_meeting(d, ss.get("mf_time"), location, topic, fmt,
-                       kind=ss.get("mf_kind"), event_id=ss.get("mf_event_id"))
+        mid = db.add_meeting(d, ss.get("mf_time"), location, topic, fmt,
+                             kind=ss.get("mf_kind"), event_id=ss.get("mf_event_id"))
+        audit.log_ui(ss, "meeting_create", entity="meeting", entity_id=mid,
+                     summary=f"Добавлено: {ss.get('mf_kind')} от {_fmt_date(d)}, {audit.show(topic)}")
     except ValueError as e:
         ss["mf_msg"] = ("error", str(e))
         return
@@ -951,6 +1010,20 @@ def admin_report() -> None:
 # ── Admin: report settings ──────────────────────────────────────────────────
 
 
+def _audit_report_settings(old: dict, new: dict) -> None:
+    def sig(items: list[dict]) -> str:
+        return "; ".join(f"{i['position']} - {i['name']}" for i in items)
+
+    changes = audit.diff_fields(
+        {"Название СНО": old["sno_name"], "Надпись над заголовком": old["appendix_label"],
+         "Подписанты": sig(old["signatories"])},
+        {"Название СНО": new["sno_name"], "Надпись над заголовком": new["appendix_label"],
+         "Подписанты": sig(new["signatories"])})
+    if changes:
+        audit.log_ui(st.session_state, "settings_change", entity="settings",
+                     summary="Настройки отчёта: " + audit.describe_changes(changes), details={"changes": changes})
+
+
 def admin_settings() -> None:
     st.subheader("Настройки отчёта")
     s = db.get_report_settings()
@@ -977,6 +1050,7 @@ def admin_settings() -> None:
         if st.form_submit_button("Сохранить настройки", type="primary"):
             rows = edited.fillna("").to_dict("records")
             db.save_report_settings(sno_name, appendix, rows)
+            _audit_report_settings(s, db.get_report_settings())
             st.success("Настройки сохранены.")
             st.rerun()
 
@@ -985,12 +1059,50 @@ def admin_settings() -> None:
         st.text(f"{sig['position']} {report.SIGNATURE_LINE}/{sig['name']}")
 
     st.divider()
+    _backup_section()
+    st.divider()
     ua.catalog_editor()
+
+
+def _backup_downloaded() -> None:
+    """on_click скачивания: запись в журнал (сам файл уже у пользователя)."""
+    info = st.session_state.get("_backup_info") or {}
+    audit.log_ui(st.session_state, "backup_download", entity="database",
+                 summary="Скачан бэкап базы (zip: JSON + CSV по таблицам)"
+                         + (f"; строк: {info.get('rows')}" if info else ""),
+                 details=info)
+
+
+def _backup_section() -> None:
+    st.subheader("Резервная копия базы")
+    st.warning(backup.SENSITIVE_NOTE + " Секрет входа по cookie в файл не попадает.")
+    st.caption("Zip: backup.json (полный дамп всех таблиц, из него восстанавливается база) и CSV по каждой "
+               "таблице (для просмотра в Excel). Восстановление из интерфейса не делается: только скриптом "
+               "restore_backup.py на компьютере администратора, с подтверждением (см. README).")
+    ss = st.session_state
+    if st.button("Подготовить бэкап", key="backup_make", icon=":material/database:"):
+        try:
+            data = backup.build_zip()
+            counts = backup.current_counts()
+            ss["_backup_bytes"] = data
+            ss["_backup_name"] = backup.default_filename()
+            ss["_backup_info"] = {"rows": sum(counts.values()), "tables": counts, "bytes": len(data)}
+        except Exception as exc:  # noqa: BLE001
+            ss.pop("_backup_bytes", None)
+            st.error(f"Не удалось сделать бэкап: {exc.__class__.__name__}: {exc}")
+    if ss.get("_backup_bytes"):
+        info = ss.get("_backup_info") or {}
+        st.success(f"Бэкап готов: таблиц {len(info.get('tables', {}))}, строк {info.get('rows', 0)}, "
+                   f"{len(ss['_backup_bytes']) / 1024:.0f} КБ.")
+        st.download_button("⬇️ Скачать бэкап", data=ss["_backup_bytes"], file_name=ss["_backup_name"],
+                           mime="application/zip", type="primary", key="backup_dl",
+                           on_click=_backup_downloaded)
 
 
 def admin_panel(user: dict) -> None:
     st.title("Панель лидера СНО")
-    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все достижения", "Настройки"])
+    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все достижения",
+                    "Что дозаполнить", "Журнал", "Настройки"])
     with tabs[0]:
         admin_members(user)
     with tabs[1]:
@@ -1002,6 +1114,10 @@ def admin_panel(user: dict) -> None:
     with tabs[4]:
         ua.admin_achievements(user, _year_choices(include_all=True), _year_label)
     with tabs[5]:
+        ua.admin_todo(user, _year_choices(include_all=True), _year_label)
+    with tabs[6]:
+        ua.admin_audit_log()
+    with tabs[7]:
         admin_settings()
 
 

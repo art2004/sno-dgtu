@@ -12,6 +12,7 @@ from typing import Optional
 import streamlit as st
 
 import achievements as ach
+import audit
 import db
 import ru_text
 
@@ -141,7 +142,8 @@ def _save_cb(pfx: str, acting: dict, record_id: Optional[int], form: str) -> Non
         ss[_k(pfx, "msg")] = ("error", "Выберите вид достижения.")
         return
     try:
-        res = ach.save_achievement(_collect(pfx, kind, form), acting, achievement_id=record_id)
+        res = ach.save_achievement(_collect(pfx, kind, form), acting, achievement_id=record_id,
+                                   audit_ctx=audit.who(ss))
     except ach.DuplicateAchievement as e:
         ss[_k(pfx, "msg")] = ("warning", str(e))
         return
@@ -155,6 +157,8 @@ def _save_cb(pfx: str, acting: dict, record_id: Optional[int], form: str) -> Non
     if record_id:
         ss[f"edit_{record_id}"] = False
         ss["mine_msg"] = ss["adm_a_msg"] = msgs
+        if pfx.startswith("td"):
+            ss["td_msg"] = msgs  # вкладка «Что дозаполнить» показывает своё сообщение
         ss.pop(_k(pfx, "msg"), None)
         reset_form(pfx)
     else:
@@ -431,7 +435,8 @@ def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False
         st.warning(f"Удалить «{title}»?")
         b1, b2, _ = st.columns([1, 1, 4])
         if b1.button("Да, удалить", key=f"yes_a_{rid}", type="primary"):
-            ach.delete_achievement(rid, owner_id=acting["id"] if owner_only else None)
+            ach.delete_achievement(rid, owner_id=acting["id"] if owner_only else None,
+                                   audit_ctx=audit.who(st.session_state))
             st.session_state.pop(f"confirm_del_a_{rid}", None)
             st.session_state["mine_msg"] = ("success", "Запись удалена.")
             st.rerun()
@@ -528,13 +533,126 @@ def admin_achievements(acting: dict, year_choices: list[int], year_label) -> Non
         st.warning(f"Удалить запись «{r['title']}» ({r['owner_name'] or 'СНО'})?")
         b1, b2, _ = st.columns([1, 1, 4])
         if b1.button("Да, удалить", type="primary", key="aa_yes"):
-            ach.delete_achievement(pick)
+            ach.delete_achievement(pick, audit_ctx=audit.who(st.session_state))
             st.session_state.pop("aa_confirm", None)
             st.session_state["adm_a_msg"] = ("success", "Запись удалена.")
             st.rerun()
         if b2.button("Отмена", key="aa_no"):
             st.session_state.pop("aa_confirm", None)
             st.rerun()
+
+
+# ── Admin: «Что дозаполнить» ────────────────────────────────────────────────
+
+TODO_PAGE = 25
+
+
+def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # noqa: ANN001
+    import pandas as pd
+
+    import todo
+
+    st.subheader("Что дозаполнить")
+    st.caption("Записи, которые не попадут в годовой отчёт или заполнены не полностью. Правила те же, что в "
+               "предупреждениях годового отчёта: нет уровня или подпункта, у публикаций нет индексации, долей "
+               "или журнала, у докладов нет темы или в названии заглушка «Мероприятие не указано», пустые "
+               "обязательные поля.")
+    show_msgs("td_msg")
+    users = db.list_users(active_only=False)
+    uopts = {0: "- все -", **{u["id"]: f"{u['full_name']} (@{u['login']})" for u in users}}
+    c1, c2, c3 = st.columns([3, 2, 4])
+    uid = c1.selectbox("Участник", list(uopts), format_func=uopts.get, key="td_user")
+    year = c2.selectbox("Период", year_choices, format_func=year_label, key="td_year")
+    types = c3.multiselect("Тип проблемы", list(todo.PROBLEM_LABELS), default=todo.DEFAULT_TYPES,
+                           format_func=todo.PROBLEM_LABELS.get, key="td_types")
+    recs = todo.list_todo(year=year or None, owner_id=uid or None, types=types)
+    by_type = todo.counts_by_type(todo.list_todo(year=year or None, owner_id=uid or None,
+                                                 types=list(todo.PROBLEM_LABELS)))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Записей к дозаполнению", len(recs))
+    m2.metric("Не попадут в отчёт", sum(1 for r in recs if not r["counted"]))
+    m3.metric("Участников", len({r["owner_id"] for r in recs}))
+    if by_type:
+        st.caption("По типам (запись с несколькими проблемами учтена в каждой): " + "; ".join(
+            f"{todo.PROBLEM_LABELS[c]} - {n}" for c, n in by_type.items() if c in todo.PROBLEM_LABELS))
+    if not recs:
+        st.success("Всё заполнено: по выбранным фильтрам записей для дозаполнения нет.")
+        return
+    st.download_button("⬇️ Выгрузить список (.xlsx)", data=todo.build_xlsx(recs, year_label(year)),
+                       file_name=f"Что_дозаполнить_{year_label(year).replace(' ', '_')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       type="primary", key="td_xlsx")
+    owners = todo.counts_by_owner(recs)
+    with st.expander(f"По участникам ({len(owners)})"):
+        st.dataframe(pd.DataFrame([{"Участник": n, "Записей": k} for n, k in owners.items()]),
+                     hide_index=True, width="stretch")
+
+    pages = max(1, -(-len(recs) // TODO_PAGE))
+    if st.session_state.get("td_page", 1) > pages:
+        st.session_state["td_page"] = 1
+    page = int(st.number_input(f"Страница (по {TODO_PAGE} записей, всего страниц: {pages})", 1, pages,
+                               key="td_page")) if pages > 1 else 1
+    open_id = st.session_state.get("td_open")
+    if open_id not in {r["id"] for r in recs}:  # запись заполнена / удалена - форму не держим
+        st.session_state.pop("td_open", None)
+        open_id = None
+    for r in recs[(page - 1) * TODO_PAGE: page * TODO_PAGE]:
+        rid = r["id"]
+        a, b, c = st.columns([6, 2, 1], vertical_alignment="center")
+        a.markdown(f"**{r['title'] or '(без названия)'}**  \n"
+                   f"{r['owner_name'] or 'СНО'} · {r['kind_label']} · {ach.fmt_date(r['date_from'])}")
+        a.markdown(":orange-badge[⚠ " + r["problem_text"] + "]")
+        b.caption("в отчёт не попадёт" if not r["counted"] else "в отчёте, но неполная")
+        if c.button("✏️ Открыть", key=f"td_btn_{rid}", help="Открыть запись для редактирования"):
+            st.session_state["td_open"] = None if open_id == rid else rid
+            st.rerun()
+        if open_id == rid:
+            with st.container(border=True):
+                achievement_form(f"td{rid}_", acting, record=r)
+    st.caption("Подсказка: после сохранения запись исчезает из списка, если всё заполнено.")
+
+
+# ── Admin: «Журнал» ─────────────────────────────────────────────────────────
+
+
+def admin_audit_log() -> None:
+    import pandas as pd
+
+    st.subheader("Журнал действий")
+    st.caption("Кто, когда и что сделал: достижения (создание, изменение, удаление), вход, режим «от имени "
+               "участника», импорт, настройки, участники и заседания. Время - московское. Пароли и их хэши "
+               "в журнал не пишутся.")
+    people = audit.known_users()
+    uopts = {0: "- все -", **dict(people)}
+    c1, c2 = st.columns([2, 3])
+    uid = c1.selectbox("Пользователь", list(uopts), format_func=uopts.get, key="al_user",
+                       help="Тот, кто действовал, тот, от чьего имени действовали, или чья запись изменена.")
+    acts = c2.multiselect("Действие", list(audit.ACTION_LABELS), format_func=audit.action_label, key="al_actions",
+                          placeholder="Все действия")
+    d1, d2, d3 = st.columns([1, 1, 3])
+    d_from = d1.date_input("С даты", value=None, format="DD.MM.YYYY", key="al_from")
+    d_to = d2.date_input("По дату", value=None, format="DD.MM.YYYY", key="al_to")
+    q = d3.text_input("Поиск", key="al_search", placeholder="название, ФИО, номер записи, слово из описания…")
+    rows = audit.list_entries(user_id=uid or None, actions=acts or None, date_from=d_from, date_to=d_to, search=q)
+    st.caption(f"Найдено: {len(rows)}" + (f" (показаны последние {audit.LIST_LIMIT})"
+                                         if len(rows) >= audit.LIST_LIMIT else ""))
+    if not rows:
+        st.info("Записей по выбранным фильтрам нет.")
+        return
+    table = pd.DataFrame([{
+        "Время (МСК)": r["ts"].replace("T", " "),
+        "Кто": r["actor_name"] or r["actor_login"] or "-",
+        "От имени": r["as_user_name"] or "",
+        "Действие": audit.action_label(r["action"]),
+        "ID записи": r["entity_id"] if r["entity_id"] is not None else None,
+        "Описание (было / стало)": r["summary"],
+    } for r in rows])
+    st.dataframe(table, hide_index=True, width="stretch", height=520, column_config={
+        "ID записи": st.column_config.NumberColumn("ID записи", format="%d", width="small"),
+        "Описание (было / стало)": st.column_config.TextColumn("Описание (было / стало)", width="large"),
+    })
+    st.download_button("⬇️ Выгрузить журнал (.csv)", data=("\ufeff" + table.to_csv(index=False)).encode("utf-8"),
+                       file_name="Журнал_действий.csv", mime="text/csv", key="al_csv")
 
 
 # ── Admin: catalog editor («Настройки») ─────────────────────────────────────

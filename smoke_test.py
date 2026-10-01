@@ -32,7 +32,7 @@ def _reset_pg(target: str) -> None:
     with db.get_engine(target).begin() as conn:
         conn.execute(text(
             "DROP TABLE IF EXISTS achievement_people, achievements, kind_subpoints, kinds, "
-            "indicator_rows, indicators, participations, events, users, meetings, settings CASCADE"
+            "indicator_rows, indicators, participations, events, users, meetings, settings, audit_log CASCADE"
         ))
 
 
@@ -767,6 +767,10 @@ def main() -> None:
             return pg_url
 
         smoke_annual.run_all(_fresh_pg(), _fresh_pg)
+        import smoke_features
+
+        _reset_pg(pg_url)
+        smoke_features.run_all(_fresh_pg)
         _reset_pg(pg_url)
         print("OK (Postgres)")
         return
@@ -778,6 +782,10 @@ def main() -> None:
     import smoke_annual
 
     smoke_annual.run_all(tmp.with_name("sno_annual.db"), lambda: tmp.with_name("sno_annual_mig.db"))
+    import smoke_features
+
+    counter = iter(range(1000))
+    smoke_features.run_all(lambda: tmp.with_name(f"sno_feat_{next(counter)}.db"))
     print("OK")
     print(f"  smoke db: {tmp}")
 

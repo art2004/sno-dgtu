@@ -5,3 +5,5 @@ data/*.db
 data/*.db-*
 .streamlit/secrets.toml
 .idea/
+sno_backup_*.zip
+before_restore_*.zip

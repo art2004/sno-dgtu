@@ -347,6 +347,29 @@ _SCHEMA = [
         value TEXT NOT NULL
     )
     """,
+    # Журнал действий (см. audit.py). Без внешних ключей: история переживает удаление
+    # пользователей и записей; ts - московское время ISO (текст), details - JSON.
+    """
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id {pk},
+        ts TEXT NOT NULL,
+        actor_id INTEGER,
+        actor_login TEXT,
+        actor_name TEXT,
+        as_user_id INTEGER,
+        as_user_name TEXT,
+        target_user_id INTEGER,
+        target_user_name TEXT,
+        action TEXT NOT NULL,
+        entity TEXT,
+        entity_id INTEGER,
+        summary TEXT NOT NULL DEFAULT '',
+        details TEXT NOT NULL DEFAULT '{{}}'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)",
 ]
 
 
