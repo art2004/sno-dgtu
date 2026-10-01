@@ -152,7 +152,8 @@ def _save_cb(pfx: str, acting: dict, record_id: Optional[int], form: str) -> Non
         return
     msgs = [("success", "Изменения сохранены." if record_id else f"Добавлено: {kind['label'].lower()}.")]
     if res["issues"]:
-        msgs.append(("warning", "Заполните: " + ", ".join(res["issues"])))
+        msgs.append(("warning", ("Запись сохранена, но в годовой отчёт пока не попадает. " if not res.get("counted")
+                                 else "") + "Заполните: " + "; ".join(res["issues"])))
     ss[_k(pfx, "msg")] = msgs
     if record_id:
         ss[f"edit_{record_id}"] = False
@@ -242,6 +243,9 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
     for key, label, ftype, required, extra in ach.FORMS[form]:
         lab = label + (" *" if required and ftype not in ("check",) else "")
         hlp = extra.get("help")
+        if key == "number" and ach.kind_needs_number(kind["code"], True):
+            lab = label + " *"
+            hlp = "Без номера запись сохраняется, но в годовой отчёт не попадает."
         if ftype == "text":
             ss.setdefault(f(key), "")
             st.text_input(lab, key=f(key), help=hlp,
@@ -812,9 +816,9 @@ def annual_report_section(year_choices: list[int]) -> None:
     c3.metric("Заочных докладов (не в отчёте)", data["zaochno"])
 
     if data["warnings"]:
-        with st.expander(f"⚠ Предупреждения ({len(data['warnings'])}) — записи без уровня/подпункта/долей",
+        with st.expander(f"⚠ Предупреждения ({len(data['warnings'])}) — записи без номера/уровня/подпункта/долей",
                          expanded=True):
-            st.caption("Записи без уровня или подпункта не попадают в отчёт, пока их не заполнят "
+            st.caption("Записи без номера достижения, уровня или подпункта не попадают в отчёт, пока их не заполнят "
                        "(участник в «Мои достижения» или админ во вкладке «Все достижения»).")
             st.dataframe(pd.DataFrame([{
                 "Участник": w["owner"], "Вид": w["kind"], "Название": w["title"], "Дата": w["date"],

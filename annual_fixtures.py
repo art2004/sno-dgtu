@@ -95,7 +95,8 @@ def load(db_path=None, password: str = "pass1234") -> dict:  # noqa: ANN001
     add("publication", "cholutaeva", row_id=R("I02.white"),
         title="Влияние низина на рост и выживаемость годовиков стерляди",
         owner_share=40, coauthors=[{"user_id": uid["sarkisyan"], "name": PEOPLE["sarkisyan"], "share": 30}],
-        journal="Рыбоводство и рыбное хозяйство", year=2025, doi="10.33920/sel-09-2510-05")
+        journal="Рыбоводство и рыбное хозяйство", year=2025, doi="10.33920/sel-09-2510-05",
+        number="Р-Н-9210-25")
 
     # 3. Конкурсы: 3 человека с 3 номерами на одном кейс-чемпионате = 3
     for who, num in (("sarkisyan", "Р-Н-5828-25"), ("cholutaeva", "Р-Н-6768-25"), ("katanaeva", "Р-Н-2973-25")):
@@ -116,17 +117,20 @@ def load(db_path=None, password: str = "pass1234") -> dict:  # noqa: ANN001
 
     # 8. Стипендии (учебный год)
     add("stipend", "sarkisyan", row_id=R("I08.president"),
-        title="Стипендия Президента РФ по приоритетным направлениям", ayear="2024-2025")
-    for who in ("marchenko", "katanaeva", "sarkisyan"):
-        add("stipend", who, row_id=R("I08.government"), title="Стипендия Правительства РФ", ayear="2025-2026")
-    add("stipend", "sarkisyan", row_id=R("I08.regional"), title="Стипендия Губернатора РО", ayear="2025-2026")
+        title="Стипендия Президента РФ по приоритетным направлениям", ayear="2024-2025", number="Р-Н-9201-25")
+    for who, num in (("marchenko", "Р-Н-9202-25"), ("katanaeva", "Р-Н-9203-25"), ("sarkisyan", "Р-Н-9204-25")):
+        add("stipend", who, row_id=R("I08.government"), title="Стипендия Правительства РФ", ayear="2025-2026",
+            number=num)
+    add("stipend", "sarkisyan", row_id=R("I08.regional"), title="Стипендия Губернатора РО", ayear="2025-2026",
+        number="Р-Н-9205-25")
     add("stipend", "martynuk", row_id=R("I08.other"),
         title="«Умная стипендия» банка «Центр-инвест» и Фонда целевого капитала «Образование и наука ЮФО»",
-        ayear="2024-2025")
+        ayear="2024-2025", number="Р-Н-9206-25")
 
     # 7 / 9. Грант: заявка и работы
     add("grant", "gaidai", subpoint_id=SP("grant.app"), row_id=R("I07.ru"), title="Российский научный фонд",
-        project="Биосовместимые покрытия на основе тантала", date_from="2025-03-15", status="подана")
+        project="Биосовместимые покрытия на основе тантала", date_from="2025-03-15", status="подана",
+        number="Р-Н-9207-25")
     add("grant", "marchenko", subpoint_id=SP("grant.pp"), title="075-03-2025-302/5", date_from="2025-04-22",
         topic="Разработка новой технологии дифференцированной уборки зерновых колосовых культур",
         number="Р-Х-349-25")
@@ -141,9 +145,9 @@ def load(db_path=None, password: str = "pass1234") -> dict:  # noqa: ANN001
 
     # 10. Научный обмен
     add("exchange", "rusanova", row_id=R("I10.intl"), title="SPARK Program team", date_from="2025-07-01",
-        date_to="2025-08-31")
+        date_to="2025-08-31", number="Р-Н-9208-25")
     add("exchange", "rusanova", row_id=R("I10.intl"), title="Viticulture and Oenology Engineering",
-        date_from="2025-09-01", date_to="2026-01-31")
+        date_from="2025-09-01", date_to="2026-01-31", number="Р-Н-9209-25")
 
     # 11 / 12. Организация мероприятий (от СНО)
     add("org_sci", None, row_id=R("I11.intl"), title="III Школа молодых учёных", date_from="2025-04-14",

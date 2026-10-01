@@ -300,6 +300,18 @@ _COLUMNS = ("title", "date_from", "date_to", "topic", "number", "link", "ochno")
 EVENT_KINDS = {"doklad": "конференция", "contest": "конкурс", "edu": "образовательное",
                "expo": "выставка", "volunteer": "волонтёрство"}
 NUMBER_MAX_LEN = 64
+# Номер достижения (портфолио) нужен для попадания записи в годовой отчёт у всех видов, кроме:
+#  * agreement (Соглашение с партнёром) - в форме вообще нет поля «номер»;
+#  * sno_contest (Конкурс оценки СНО), funded (Финансируемая работа) - записи самого СНО, не личные
+#    достижения участника (админский учёт; ВОПРОС ПОЛЬЗОВАТЕЛЮ - см. отчёт);
+#  * любой записи без владельца (админская запись «СНО в целом» - личного портфолио нет).
+# Организация мероприятий (org_sci, org_pop): у записи с участником-организатором номер нужен.
+NUMBER_EXEMPT_KINDS = frozenset({"agreement", "sno_contest", "funded"})
+PLACEHOLDER_PREFIX = "мероприятие не указано"  # так импорт из ЛК помечает доклады без мероприятия
+PLACEHOLDER_MSG = "в названии заглушка «Мероприятие не указано» - впишите мероприятие"
+# «номера», которыми заполняют поле, чтобы отвязаться: считаются пустым номером
+NUMBER_PLACEHOLDERS = frozenset({"-", "--", "?", "0", "НЕТ", "Б/Н", "БН", "Н/Д", "НД", "NONE", "NULL"})
+NUMBER_MISSING_MSG = "укажите номер достижения (без него запись не попадает в отчёт)"
 
 
 class DuplicateAchievement(ValueError):
@@ -431,6 +443,8 @@ def normalize_number(value: Optional[str]) -> Optional[str]:
     s = re.sub(r"[‐‑‒–—−]", "-", s)
     s = re.sub(r"\s*-\s*", "-", s)
     s = s.upper().translate(_LAT2CYR)
+    if s in NUMBER_PLACEHOLDERS:
+        return None
     if len(s) > NUMBER_MAX_LEN:
         raise ValueError(f"Номер достижения не длиннее {NUMBER_MAX_LEN} символов")
     return s
@@ -958,6 +972,10 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
     ind_id, row_id, form = resolve_target(kind, subpoint_id, None if no_index else (data.get("row_id") or None))
     if ind_id is not None and not row_id and not no_index and indicator_rows(ind_id, db_path, include_hidden=True):
         raise ValueError("Выберите уровень / подпункт")
+    if row_id and ind_id is not None and row_id not in {x["id"] for x in indicator_rows(ind_id, db_path, include_hidden=True)}:
+        raise ValueError("Выбранный уровень / подпункт не относится к этому виду достижения")
+    if row_id and ind_id is None:
+        raise ValueError("Выбранный уровень / подпункт не относится к этому виду достижения")
     vals: dict[str, Any] = {}
     details: dict[str, Any] = dict(old["details"]) if old else {}
     if row_id:
@@ -990,6 +1008,8 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
             continue
         if ftype in ("date", "date_opt"):
             v = _iso(v)
+            if v and not 1990 <= int(v[:4]) <= 2100:
+                raise ValueError(f"Поле «{short}»: год {v[:4]} выглядит как опечатка (допустимо 1990-2100)")
         elif ftype == "check":
             v = 1 if v else 0
         elif isinstance(v, str):
@@ -1089,7 +1109,7 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
             db._delete_orphans(conn, [int(old_event)])
     rec = get_achievement(aid, db_path)
     _audit_save(rec, old, acting_user, audit_ctx, db_path)
-    return {"id": aid, "issues": rec["issues"] if rec else []}
+    return {"id": aid, "issues": rec["issues"] if rec else [], "counted": bool(rec and rec["counted"])}
 
 
 # ── Audit log hooks (журнал действий; сбой журнала не ломает сохранение) ─────
@@ -1217,7 +1237,7 @@ def _delete_achievement(achievement_id: int, owner_id: Optional[int], db_path: D
 _SELECT = """
     SELECT a.*, k.code AS kind_code, k.label AS kind_label, k.form AS kind_form, k.admin_only,
            i.label AS indicator_label, i.code AS indicator_code, i.dimension,
-           r.label AS row_label, r.code AS row_code, s.label AS subpoint_label, s.form AS subpoint_form,
+           r.label AS row_label, r.code AS row_code, r.indicator_id AS row_indicator_id, s.label AS subpoint_label, s.form AS subpoint_form,
            u.full_name AS owner_name, u.login AS owner_login
     FROM achievements a
     JOIN kinds k ON k.id = a.kind_id
@@ -1242,6 +1262,9 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
             people.setdefault(p["achievement_id"], []).append(p)
     has_rows = {r[0] for r in conn.execute(text("SELECT DISTINCT indicator_id FROM indicator_rows"))}
     dup_of = _publication_duplicates(conn) if any(r["kind_form"] == "publication" for r in recs) else {}
+    dup_num = {n: c for n, c in conn.execute(text(
+        "SELECT number, COUNT(*) FROM achievements WHERE number IS NOT NULL AND number <> '' "
+        "GROUP BY number HAVING COUNT(*) > 1"))}
     for r in recs:
         r["people"] = people.get(r["id"], [])
         r["details"] = _details(r["details"])
@@ -1253,6 +1276,7 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
             r["form"] = r["kind_form"]
         r["indicator_has_rows"] = r["indicator_id"] in has_rows
         r["dup_of"] = dup_of.get(r["id"])
+        r["dup_number"] = dup_num.get(r["number"], 1) - 1 if r["number"] else 0
         r["counted"] = is_counted(r)
         r["issues"] = record_issues(r)
         if r["details"].get("no_index") and not r["row_id"]:
@@ -1361,9 +1385,105 @@ def list_achievements(owner_id: Optional[int] = None, year: Optional[int] = None
     return recs
 
 
+def has_number(r: dict) -> bool:
+    """Номер действительно указан: не пусто, не заглушка («нет», «-», «б/н») и есть хотя бы одна цифра."""
+    v = re.sub(r"\s+", "", str(r.get("number") or "")).upper()
+    return bool(v) and v not in {re.sub(r"\s+", "", x) for x in NUMBER_PLACEHOLDERS} \
+        and any(ch.isdigit() for ch in v)
+
+
+def kind_needs_number(kind_code: Optional[str], owner_id: Any = True) -> bool:
+    """Нужен ли записи номер достижения для попадания в отчёт (см. NUMBER_EXEMPT_KINDS)."""
+    return kind_code not in NUMBER_EXEMPT_KINDS and bool(owner_id)
+
+
+def _in_report_otherwise(r: dict) -> bool:
+    """Запись вообще претендует на отчёт: не заочный доклад, не «без индексации», не дубль статьи
+    (у таких номер и обязательные поля не проверяем - они вне отчёта по замыслу)."""
+    d = r.get("details") or {}
+    return not (d.get("no_index") or r.get("dup_of") or (r.get("form") == "doklad" and not r.get("ochno")))
+
+
+def missing_required(r: dict) -> list[str]:
+    """Обязательные поля формы (FORMS[...][required]), которые у записи пусты или недопустимы
+    (метки без пояснений). Поля, у которых есть свой текст в record_issues (журнал, учебный год,
+    тема доклада), и список людей здесь не проверяются."""
+    out = []
+    d = r.get("details") or {}
+    for key, label, ftype, required, extra in FORMS.get(r.get("form"), []):
+        if not required or ftype in ("people", "authors", "meeting", "check") \
+                or key in _OWN_MESSAGE_FIELDS.get(r.get("form"), ()):
+            continue
+        if ftype == "pubdate":
+            val = r.get("date_from")
+        elif ftype == "year":
+            val = d.get("year") or r.get("date_from")
+        elif key in _COLUMNS:
+            val = r.get(key)
+        else:
+            val = d.get(key)
+        bad = val is None or (isinstance(val, str) and not val.strip())
+        if ftype == "select" and not bad and val not in extra["options"]:
+            bad = True
+        if bad:
+            out.append(label.split(" (")[0])
+    return out
+
+
+# поля с собственным текстом в record_issues (чтобы не дублировать «пустое поле»), по форме
+_OWN_MESSAGE_FIELDS = {"publication": ("journal",), "stipend": ("ayear",), "doklad": ("topic",)}
+
+
+def _gaps(r: dict) -> list[tuple[bool, str]]:
+    """Все недочёты записи: (блокирует ли отчёт, текст). Блокирующие -> is_counted = False."""
+    out: list[tuple[bool, str]] = []
+    d = r["details"]
+    if r["kind_form"] == "grant" and not r["subpoint_id"]:
+        out.append((True, "выберите подпункт гранта"))
+    elif r["indicator_id"] is not None and r.get("indicator_has_rows") and r["row_id"] is None \
+            and not d.get("no_index"):
+        if r["form"] == "publication":
+            out.append((True, "выберите индексацию"
+                        + (" (было «Без индексации»)" if d.get("legacy_indexing") == "Без индексации" else "")))
+        else:
+            out.append((True, "укажите уровень" if r["dimension"] == "level" else "выберите подпункт"))
+    if r.get("row_id") is not None and r.get("row_indicator_id") not in (None, r["indicator_id"]):
+        out.append((True, "уровень / подпункт не относится к показателю записи - выберите заново"))
+    if r.get("dup_of"):
+        out.append((True, f"дубль статьи из записи участника {r['dup_of']['owner_name'] or 'СНО'} - "
+                    "в отчёт идёт один раз, эту запись лучше удалить"))
+    if r["form"] == "publication":
+        if r["owner_share"] is None or any(p["share"] is None for p in r["people"]):
+            out.append((False, "заполните долю"))
+        if not d.get("journal") and not d.get("bib"):
+            out.append((False, "заполните журнал"))
+        if d.get("legacy_coauthors") and r["owner_share"] is None:
+            out.append((False, "проверьте главного автора (перенесено: первый добавивший)"))
+    if r["form"] == "doklad" and not (r["topic"] or "").strip():
+        out.append((True, "заполните тему доклада"))  # строка отчёта «доклад на тему: «»» без темы пуста
+    if r["form"] == "stipend" and not re.match(r"^\d{4}-\d{4}$", str(d.get("ayear") or "")):
+        out.append((False, "укажите учебный год"))
+    if r.get("dup_number"):
+        out.append((False, f"этот номер достижения уже указан в другой записи ({r['dup_number']}) - "
+                    "проверьте, не внесено ли одно достижение дважды"))
+    if _in_report_otherwise(r):
+        if kind_needs_number(r.get("kind_code"), r.get("owner_id")) and not has_number(r):
+            out.append((True, NUMBER_MISSING_MSG if not (r.get("number") or "").strip() else
+                        f"номер достижения «{r['number']}» не похож на номер (нужны цифры, например Р-Н-1234-25)"))
+        if r["form"] == "doklad" and (r["title"] or "").strip().lower().startswith(PLACEHOLDER_PREFIX):
+            out.append((True, PLACEHOLDER_MSG))
+        if not r.get("owner_id") and not r.get("admin_only"):
+            out.append((True, "укажите участника"))
+        miss = missing_required(r)
+        if miss:
+            out.append((True, "пустые поля: " + ", ".join(miss)))
+    return out
+
+
 def is_counted(r: dict) -> bool:
-    """Counting rule: 1 record = 1 unit, if its indicator/sub-row is known; заочные доклады
-    are stored but not reported."""
+    """Counting rule: 1 record = 1 unit, if its indicator/sub-row is known and the record is
+    complete: portfolio number (for member kinds), required fields, doklad topic. Заочные
+    доклады are stored but not reported."""
     if r["indicator_id"] is None:
         return False
     if r.get("indicator_has_rows") and r["row_id"] is None:
@@ -1372,37 +1492,13 @@ def is_counted(r: dict) -> bool:
         return False
     if r.get("dup_of"):  # the same article is already counted in another record
         return False
-    return True
+    return not any(blocks for blocks, _ in _gaps(r))
 
 
 def record_issues(r: dict) -> list[str]:
-    """What the owner/admin still has to fill («заполните …»)."""
-    out = []
-    d = r["details"]
-    if r["kind_form"] == "grant" and not r["subpoint_id"]:
-        out.append("выберите подпункт гранта")
-    elif r["indicator_id"] is not None and r.get("indicator_has_rows") and r["row_id"] is None \
-            and not d.get("no_index"):
-        if r["form"] == "publication":
-            out.append("выберите индексацию"
-                       + (" (было «Без индексации»)" if d.get("legacy_indexing") == "Без индексации" else ""))
-        else:
-            out.append("укажите уровень" if r["dimension"] == "level" else "выберите подпункт")
-    if r.get("dup_of"):
-        out.append(f"дубль статьи из записи участника {r['dup_of']['owner_name'] or 'СНО'} - "
-                   "в отчёт идёт один раз, эту запись лучше удалить")
-    if r["form"] == "publication":
-        if r["owner_share"] is None or any(p["share"] is None for p in r["people"]):
-            out.append("заполните долю")
-        if not d.get("journal") and not d.get("bib"):
-            out.append("заполните журнал")
-        if d.get("legacy_coauthors") and r["owner_share"] is None:
-            out.append("проверьте главного автора (перенесено: первый добавивший)")
-    if r["form"] == "doklad" and not (r["topic"] or "").strip():
-        out.append("заполните тему доклада")
-    if r["form"] == "stipend" and not re.match(r"^\d{4}-\d{4}$", str(d.get("ayear") or "")):
-        out.append("укажите учебный год")
-    return out
+    """What the owner/admin still has to fill («заполните …»). Часть блокирует отчёт
+    (см. _gaps), остальное - предупреждения (доли, журнал, учебный год)."""
+    return [msg for _, msg in _gaps(r)]
 
 
 # ── Summaries & stats ───────────────────────────────────────────────────────
@@ -1817,6 +1913,12 @@ def report_data(year: int, db_path: DbTarget = None) -> dict:
                  "title": r["title"], "date": fmt_date(r["date_from"]),
                  "issues": ", ".join(r["issues"]), "counted": r["counted"]}
                 for r in recs if r["issues"] and not r["details"].get("no_index")]
+    # записи без даты не попадают ни в один год (фильтр по периоду) - предупреждаем в каждом отчёте
+    warnings += [{"id": r["id"], "owner": r["owner_name"] or "СНО", "kind": r["kind_label"],
+                  "title": r["title"], "date": "",
+                  "issues": ", ".join(["нет даты - запись не попадёт ни в один годовой отчёт", *r["issues"]]),
+                  "counted": False}
+                 for r in list_achievements(db_path=db_path) if not r["date_from"]]
     zaochno = sum(1 for r in recs if r["form"] == "doklad" and not r["ochno"])
     return {"year": year, "sno_name": sno_name, "indicators": indicators, "warnings": warnings,
             "zaochno": zaochno, "total": sum(i["count"] for i in indicators), "records": recs}

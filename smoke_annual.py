@@ -342,7 +342,8 @@ def run_migration(target) -> None:  # noqa: ANN001
     art = by[("publication", "mig_a", "Статья про корма")]  # main author = first added
     assert art["row_code"] == "I02.vak" and [p["name"] for p in art["people"]] == ["Второй Автор"]
     assert art["details"]["coauthor_numbers"] == ["Р-Н-3-25"] and "заполните долю" in art["issues"]
-    assert art["counted"]
+    # у главного автора нет номера (номер есть только у соавтора) -> в отчёт не идёт, пока не впишут
+    assert not art["counted"] and any("номер достижения" in i for i in art["issues"])
     noidx = by[("publication", "mig_c", "Статья без индекса")]
     assert noidx["row_id"] is None and noidx["details"].get("no_index") and not noidx["counted"]
     assert not any("индексац" in i for i in noidx["issues"])
@@ -351,7 +352,8 @@ def run_migration(target) -> None:  # noqa: ANN001
     g = by[("grant", "mig_a", "УМНИК 2025")]
     assert g["subpoint_id"] is None and "выберите подпункт гранта" in g["issues"]
     data = ach.report_data(2025, db_path=target)
-    assert len(data["warnings"]) == 6 and data["total"] == 2  # article (ВАК) + stipend «иные»
+    # без номера в отчёт не идёт ничего (статья ВАК и стипендия «иные» были бы в отчёте)
+    assert len(data["warnings"]) == 6 and data["total"] == 0
     # users, roles, cookies, meetings keep working
     assert auth.user_from_token(tok, db_path=target)["id"] == a
     assert db.list_meetings(2025, db_path=target)[0]["event_id"] == eid
@@ -361,6 +363,7 @@ def run_migration(target) -> None:  # noqa: ANN001
     admin = _admin(target)
     ach.save_achievement({"kind_id": art["kind_id"], "owner_id": a, "row_id": art["row_id"],
                           "title": art["title"], "journal": "Вестник", "year": 2025, "owner_share": 60,
+                          "number": "Р-Н-77-25",
                           "coauthors": [{"user_id": b, "name": "Второй Автор", "share": 40}]},
                          admin, achievement_id=art["id"], db_path=target)
     art2 = ach.get_achievement(art["id"], target)
@@ -423,13 +426,14 @@ def run_coauthors(target) -> None:  # noqa: ANN001
     rinc = ach.row_by_code("I02.rinc", target)["id"]
     base_total = ach.report_data(2026, db_path=target)["total"]
     art = {"kind_id": K["id"], "row_id": rinc, "title": "Совместная статья о кормах", "journal": "Вестник",
-           "year": 2026, "doi": "10.1000/co.1", "owner_share": 50,
+           "year": 2026, "doi": "10.1000/co.1", "owner_share": 50, "number": "Р-Н-501-26",
            "coauthors": [{"user_id": b, "name": B["full_name"], "share": 30},
                          {"name": "Внешний Виктор Викторович", "share": 20}]}
     aid = ach.save_achievement(art, A, db_path=target)["id"]
     # free-text co-author with a member's exact name: no name matching, C sees nothing
     txt = ach.save_achievement({**art, "title": "Статья с текстовым соавтором", "doi": "",
-                                "coauthors": [{"name": C["full_name"], "share": 50}]}, A, db_path=target)["id"]
+                                "number": "Р-Н-502-26", "coauthors": [{"name": C["full_name"], "share": 50}]},
+                               A, db_path=target)["id"]
     mine_b = ach.list_achievements(owner_id=b, with_coauthored=True, db_path=target)
     assert [r["id"] for r in mine_b] == [aid] and mine_b[0]["role"] == "coauthor"
     assert mine_b[0]["my_share"] == 30 and mine_b[0]["owner_name"] == A["full_name"]
@@ -495,9 +499,13 @@ def run_coauthors(target) -> None:  # noqa: ANN001
           "duplicate hint + safety net OK")
 
 
+_PUB_N = iter(range(9000, 99999))
+
+
 def _pub(target, owner, extra=None, **kw):  # noqa: ANN001, ANN003
     K = ach.kind_by_code("publication", target)
-    base = {"kind_id": K["id"], "owner_id": owner["id"], "journal": "Тестовый журнал", "owner_share": 100}
+    base = {"kind_id": K["id"], "owner_id": owner["id"], "journal": "Тестовый журнал", "owner_share": 100,
+            "number": f"Р-Н-{next(_PUB_N)}-26"}
     return ach.save_achievement({**base, **(extra or {}), **kw}, _admin(target), db_path=target)["id"]
 
 
@@ -622,7 +630,7 @@ def run_v4_bibformat(target) -> None:  # noqa: ANN001
     aid = _pub(target, owner, row_id=ach.row_by_code("I02.vak", target)["id"], title="Статья со ссылкой",
                year=2025, owner_share=60, coauthors=[{"name": "Иванова Анна Петровна", "share": 40}],
                authors_lat="Kozyrev, D., & Ivanova, A.", bib="Kozyrev, D., & Ivanova, A. (2025). Статья со ссылкой. Журнал, 3(1), 5-9",
-               doi="10.5/x.5")
+               doi="10.5/x.5", number="")
     line = ach.record_line(ach.get_achievement(aid, target))
     assert line.startswith("(60%) Козырев Д.С., (40%) Иванова А.П. Kozyrev, D., & Ivanova, A. (2025). Статья со ссылкой. Журнал, 3(1), 5-9")
     assert line.count("Статья со ссылкой") == 1 and line.endswith("https://doi.org/10.5/x.5"), line

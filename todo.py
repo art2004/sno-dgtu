@@ -6,7 +6,8 @@
   * is_counted(r)     - попадёт ли запись в report_data (нет показателя / нет уровня / дубль);
   * как и в report_data.warnings, публикации «Без индексации» (details.no_index) - валидные и
     сюда не попадают; заочные доклады не в отчёте по замыслу - показываются только по галочке;
-  * FORMS[...][required] - обязательные поля формы, которые у записи пусты;
+  * ach.missing_required(r) - обязательные поля формы, которые у записи пусты (блокируют отчёт);
+  * номер достижения (кроме NUMBER_EXEMPT_KINDS) - без него запись не считается (is_counted=False);
   * заглушка title у докладов «Мероприятие не указано ...» (так импорт из ЛК помечает доклады,
     у которых мероприятие неизвестно).
 Каждая найденная проблема получает код (PROBLEM_LABELS); неизвестный текст record_issues попадает
@@ -21,7 +22,7 @@ from typing import Any, Optional
 import achievements as ach
 import db
 
-PLACEHOLDER_PREFIX = "мероприятие не указано"
+PLACEHOLDER_PREFIX = ach.PLACEHOLDER_PREFIX
 
 PROBLEM_LABELS = {
     "no_level": "Нет уровня / подпункта",
@@ -32,6 +33,10 @@ PROBLEM_LABELS = {
     "main_author": "Проверить главного автора",
     "no_topic": "Нет темы доклада",
     "no_ayear": "Нет учебного года",
+    "no_number": "Нет номера достижения (не попадёт в отчёт)",
+    "no_owner": "Не выбран участник",
+    "no_date": "Нет даты (не попадёт ни в один отчёт)",
+    "dup_number": "Номер повторяется в другой записи",
     "placeholder": "Заглушка «Мероприятие не указано»",
     "duplicate": "Дубль статьи",
     "required": "Пустые обязательные поля",
@@ -40,11 +45,6 @@ PROBLEM_LABELS = {
 }
 # Что считать проблемой по умолчанию: все, кроме заочных докладов (они не в отчёте по замыслу).
 DEFAULT_TYPES = [k for k in PROBLEM_LABELS if k != "zaochno"]
-
-# Поля, которые уже покрыты текстами record_issues (чтобы не дублировать «пустое поле»)
-_COVERED_REQUIRED = {"journal", "ayear", "topic"}
-# Типы полей, проверяемые другими правилами (доли, даты, список людей)
-_SKIP_FTYPES = ("people", "authors", "meeting", "check")
 
 
 def classify_issue(text_: str, form: str) -> str:
@@ -68,27 +68,19 @@ def classify_issue(text_: str, form: str) -> str:
         return "no_topic"
     if t.startswith("укажите учебный год"):
         return "no_ayear"
+    if t.startswith("укажите номер достижения") or t.startswith("номер достижения"):
+        return "no_number"
+    if t.startswith("этот номер достижения уже"):
+        return "dup_number"
+    if t.startswith("уровень / подпункт не относится"):
+        return "no_level"
+    if t.startswith("укажите участника"):
+        return "no_owner"
+    if t.startswith("в названии заглушка"):
+        return "placeholder"
+    if t.startswith("пустые поля"):
+        return "required"
     return "other"
-
-
-def _empty_required(r: dict) -> list[str]:
-    """Обязательные поля формы записи, которые пусты (метки без « *» и пояснений)."""
-    out = []
-    form = r["form"]
-    for key, label, ftype, required, _extra in ach.FORMS.get(form, []):
-        if not required or ftype in _SKIP_FTYPES or key in _COVERED_REQUIRED:
-            continue
-        if ftype == "pubdate":
-            val = r["date_from"]
-        elif ftype == "year":
-            val = r["details"].get("year") or r["date_from"]
-        elif key in ach._COLUMNS:
-            val = r.get(key)
-        else:
-            val = r["details"].get(key)
-        if val is None or (isinstance(val, str) and not val.strip()):
-            out.append(label.split(" (")[0])
-    return out
 
 
 def problems(r: dict) -> list[tuple[str, str]]:
@@ -102,11 +94,13 @@ def problems(r: dict) -> list[tuple[str, str]]:
     if r["indicator_id"] is None and not any(c == "no_level" for c, _ in out):
         # is_counted(): без показателя запись не считается (грант без подпункта уже объяснён выше)
         out.append(("no_indicator", "нет показателя - запись не попадёт в отчёт"))
-    if r["form"] == "doklad" and (r["title"] or "").strip().lower().startswith(PLACEHOLDER_PREFIX):
-        out.append(("placeholder", "в названии заглушка «Мероприятие не указано» - впишите мероприятие"))
-    miss = _empty_required(r)
-    if miss:
-        out.append(("required", "пустые поля: " + ", ".join(miss)))
+    if not r["date_from"]:
+        out.append(("no_date", "нет даты - запись не попадёт ни в один годовой отчёт"))
+    if not any(c == "required" for c, _ in out):
+        # записи вне отчёта по замыслу (заочный доклад, дубль) ach.record_issues на полноту не проверяет
+        miss = ach.missing_required(r)
+        if miss:
+            out.append(("required", "пустые поля: " + ", ".join(miss)))
     if r["form"] == "doklad" and not r["ochno"]:
         out.append(("zaochno", "заочный доклад - в отчёт не входит (так задумано)"))
     return out
@@ -118,7 +112,10 @@ def list_todo(year: Optional[int] = None, owner_id: Optional[int] = None,
     types - оставить записи, у которых есть хотя бы одна проблема из списка (None = DEFAULT_TYPES)."""
     want = set(types if types is not None else DEFAULT_TYPES)
     out = []
-    for r in ach.list_achievements(owner_id=owner_id, year=year or None, db_path=db_path):
+    recs = ach.list_achievements(owner_id=owner_id, year=year or None, db_path=db_path)
+    if year:  # записи без даты не попадают ни в один год - показываем в любом периоде
+        recs += [r for r in ach.list_achievements(owner_id=owner_id, db_path=db_path) if not r["date_from"]]
+    for r in recs:
         ps = [p for p in problems(r) if p[0] in want]
         if not ps:
             continue

@@ -25,12 +25,16 @@ def _admin(target) -> dict:  # noqa: ANN001
     return next(u for u in db.list_users(db_path=target) if u["role"] == "admin")
 
 
+_N = iter(range(100, 99999))
+
+
 def _doklad(target, owner, title="Форум Журнал", level="I01.reg", topic="Тема", actor=None, ctx=None,  # noqa: ANN001
             date_from="2026-03-10") -> int:
     K = ach.kind_by_code("doklad", target)
     return ach.save_achievement(
         {"kind_id": K["id"], "owner_id": owner, "row_id": ach.row_by_code(level, target)["id"] if level else None,
-         "title": title, "date_from": date_from, "topic": topic, "ochno": True},
+         "title": title, "date_from": date_from, "topic": topic, "ochno": True,
+         "number": f"Р-Н-{next(_N)}-26"},
         actor or _admin(target), db_path=target, audit_ctx=ctx)["id"]
 
 
@@ -200,7 +204,7 @@ def run_todo(target) -> None:  # noqa: ANN001
     # после исправления запись исчезает
     ach.save_achievement({"kind_id": ach.kind_by_code("doklad", target)["id"], "owner_id": a,
                           "row_id": ach.row_by_code("I01.ru", target)["id"], "title": "Настоящая конференция",
-                          "date_from": "2026-03-10", "topic": "Тема X", "ochno": True},
+                          "date_from": "2026-03-10", "topic": "Тема X", "ochno": True, "number": "Р-Н-77-26"},
                          admin, achievement_id=ph, db_path=target)
     assert ph not in {r["id"] for r in todo.list_todo(db_path=target)}
     # Excel
@@ -216,6 +220,185 @@ def run_todo(target) -> None:  # noqa: ANN001
     for u in (a, b):
         db.delete_user(u, acting_user_id=admin["id"], db_path=target)
     print(f"  todo OK ({len(recs)} записей к дозаполнению; фильтры, счётчики, xlsx; правила как в report_data)")
+
+
+# ── 0. Аудит: что решает, попадёт ли запись в отчёт (номер, поля, уровень, дата) ─────────────
+
+
+def run_report_gate(target) -> None:  # noqa: ANN001
+    """Каждый вид: без номера запись НЕ считается (is_counted=False) и даёт предупреждение в
+    report_data и в «Что дозаполнить»; с номером - считается. Исключения (agreement, sno_contest,
+    funded, запись без владельца) - считаются без номера. Плюс остальные дыры аудита."""
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    u = db.create_user("gate_u", "pass12345", "Проверов Пётр", db_path=target)
+    K = {k["code"]: k for k in ach.list_kinds(target, admin=True, include_hidden=True)}
+    R = lambda c: ach.row_by_code(c, target)["id"]  # noqa: E731
+    SP = lambda c: next(sp["id"] for k in K.values() for sp in k["subpoints"] if sp["code"] == c)  # noqa: E731
+    Y = "2026-05-05"
+    # (метка, вид, поля, нужен ли номер)
+    cases = [
+        ("doklad", "doklad", dict(row_id=R("I01.ru"), title="Конф", date_from=Y, topic="Тема", ochno=True), 1),
+        ("publication", "publication", dict(row_id=R("I02.vak"), title="Статья", journal="Ж", year=2026,
+                                            owner_share=100), 1),
+        ("contest", "contest", dict(row_id=R("I03.ru"), title="Кейс", date_from=Y), 1),
+        ("edu", "edu", dict(row_id=R("I04.ru"), title="Школа", date_from=Y), 1),
+        ("expo", "expo", dict(row_id=R("I05.ru"), title="Выставка", date_from=Y), 1),
+        ("ip", "ip", dict(row_id=R("I06.patent"), title="Патент", doc_number="123", date_from=Y), 1),
+        ("grant.app", "grant", dict(subpoint_id=SP("grant.app"), row_id=R("I07.ru"), title="РНФ", project="П",
+                                    date_from=Y, status="подана"), 1),
+        ("grant.rnf", "grant", dict(subpoint_id=SP("grant.rnf"), title="РНФ 1", date_from=Y, topic="Т"), 1),
+        ("grant.pp", "grant", dict(subpoint_id=SP("grant.pp"), title="ПП 1", date_from=Y, topic="Т"), 1),
+        ("grant.funds", "grant", dict(subpoint_id=SP("grant.funds"), title="Фонд 1", date_from=Y, topic="Т"), 1),
+        ("grant.hoz", "grant", dict(subpoint_id=SP("grant.hoz"), title="Хоз 1", date_from=Y, topic="Т"), 1),
+        ("stipend", "stipend", dict(row_id=R("I08.other"), title="Стипендия", ayear="2025-2026"), 1),
+        ("exchange", "exchange", dict(row_id=R("I10.intl"), title="Обмен", date_from=Y), 1),
+        ("fsi", "fsi", dict(row_id=R("I13.umnik_p"), title="УМНИК", date_from=Y), 1),
+        ("prize", "prize", dict(row_id=R("I14.ru"), title="Премия", date_from=Y), 1),
+        ("volunteer", "volunteer", dict(row_id=R("I15.ru"), title="Волонтёры", date_from=Y), 1),
+        ("org_sci(владелец)", "org_sci", dict(row_id=R("I11.ru"), title="Орг", date_from=Y), 1),
+        ("org_pop(владелец)", "org_pop", dict(row_id=R("I12.ru"), title="Орг-поп", date_from=Y), 1),
+        ("sno_contest", "sno_contest", dict(row_id=R("I16.part"), title="Конкурс СНО", date_from=Y), 0),
+        ("agreement", "agreement", dict(title="Партнёр", agreement="1 от 01.01.2026", date_from=Y), 0),
+        ("funded", "funded", dict(title="Работа", source="бюджет", date_from=Y), 0),
+    ]
+    ids = {}
+    nxt = iter(range(1, 999))
+    for label, code, f, need in cases:
+        data = {"kind_id": K[code]["id"], "owner_id": u, **f}
+        res = ach.save_achievement(data, admin, db_path=target)  # без номера сохраняется
+        rec = ach.get_achievement(res["id"], target)
+        if need:
+            assert not rec["counted"] and res["counted"] is False, label
+            assert any("номер достижения" in i for i in rec["issues"]), (label, rec["issues"])
+        else:
+            assert rec["counted"] and not rec["issues"], (label, rec["issues"])
+        ids[label] = (res["id"], data, need)
+    db.clear_cache()
+    rd = ach.report_data(2026, db_path=target)
+    warn = {w["id"]: w for w in rd["warnings"]}
+    tdp = {r["id"]: r for r in todo.list_todo(year=2026, types=["no_number"], db_path=target)}
+    for label, (aid, _data, need) in ids.items():
+        if need:
+            assert "номер достижения" in warn[aid]["issues"] and not warn[aid]["counted"], label
+            assert aid in tdp and "no_number" in tdp[aid]["problem_codes"], label
+        else:
+            assert aid not in warn and aid not in tdp, label
+    assert rd["total"] == sum(1 for *_x, need in cases if not need)  # в отчёте только 3 вида без номера
+    # с номером запись попадает в отчёт, предупреждение исчезает
+    for i, (label, (aid, data, need)) in enumerate(ids.items()):
+        if need:
+            ach.save_achievement({**data, "number": f"Р-Н-{900 + i}-26"}, admin, achievement_id=aid, db_path=target)
+    db.clear_cache()
+    rd = ach.report_data(2026, db_path=target)
+    assert rd["total"] == len(cases) and rd["warnings"] == [], (rd["total"], rd["warnings"])
+    assert not any(w for w in todo.list_todo(year=2026, db_path=target))
+
+    # запись без владельца (админская «СНО в целом») номера не требует
+    nid = ach.save_achievement({"kind_id": K["org_sci"]["id"], "owner_id": None, "row_id": R("I11.reg"),
+                                "title": "Орг от СНО", "date_from": Y}, admin, db_path=target)["id"]
+    assert ach.get_achievement(nid, target)["counted"]
+
+    # номер-заглушка и «не номер» = пустой номер
+    gid = ids["fsi"][0]
+    for bad in ("нет", "-", "б/н", "н/д"):
+        ach.save_achievement({**ids["fsi"][1], "number": bad}, admin, achievement_id=gid, db_path=target)
+        r = ach.get_achievement(gid, target)
+        assert r["number"] is None and not r["counted"], bad
+    ach.save_achievement({**ids["fsi"][1], "number": "Р-Н-абв"}, admin, achievement_id=gid, db_path=target)
+    r = ach.get_achievement(gid, target)
+    assert not r["counted"] and any("не похож на номер" in i for i in r["issues"])
+    ach.save_achievement({**ids["fsi"][1], "number": "Р-Н-905-26"}, admin, achievement_id=gid, db_path=target)
+    assert ach.get_achievement(gid, target)["counted"]
+
+    # один и тот же номер у двух записей: предупреждение (запись остаётся в отчёте)
+    a2 = ach.save_achievement({**ids["prize"][1], "title": "Премия 2", "number": "Р-Н-905-26"}, admin,
+                              db_path=target)["id"]
+    r2 = ach.get_achievement(a2, target)
+    assert r2["counted"] and any("уже указан в другой записи" in i for i in r2["issues"])
+    assert any("уже указан" in i for i in ach.get_achievement(gid, target)["issues"])
+    ach.delete_achievement(a2, db_path=target)
+
+    # заочный доклад и дубли вне отчёта по замыслу: номер для них не требуем (нет лишнего шума)
+    zid = ach.save_achievement({**ids["doklad"][1], "title": "Заочный", "ochno": False}, admin, db_path=target)["id"]
+    z = ach.get_achievement(zid, target)
+    assert not z["counted"] and z["issues"] == [], z["issues"]
+
+    # тема доклада: пустая тема блокирует (строка отчёта «доклад на тему: «»» была бы пустой)
+    did = ids["doklad"][0]
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET topic = '' WHERE id = :i"), {"i": did})
+    db.clear_cache()
+    r = ach.get_achievement(did, target)
+    assert not r["counted"] and any("тему доклада" in i for i in r["issues"])
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET topic = 'Тема' WHERE id = :i"), {"i": did})
+
+    # дыры «пустое обязательное поле» (прямая запись в БД, как в старых данных / импорте)
+    def broken(label, sql_set, needle):  # noqa: ANN001
+        aid = ids[label][0]
+        with db.get_engine(target).begin() as conn:
+            old = dict(conn.execute(text("SELECT * FROM achievements WHERE id = :i"), {"i": aid}).mappings().one())
+            conn.execute(text(f"UPDATE achievements SET {sql_set} WHERE id = :i"), {"i": aid})
+        db.clear_cache()
+        r = ach.get_achievement(aid, target)
+        assert not r["counted"] and any(needle in i for i in r["issues"]), (label, sql_set, r["issues"])
+        assert aid in {x["id"] for x in ach.report_data(2026, db_path=target)["warnings"]}, label
+        cols = ", ".join(f"{k} = :{k}" for k in ("title", "details", "owner_id", "row_id", "indicator_id"))
+        with db.get_engine(target).begin() as conn:
+            conn.execute(text(f"UPDATE achievements SET {cols} WHERE id = :id"),
+                         {**{k: old[k] for k in ("title", "details", "owner_id", "row_id", "indicator_id")},
+                          "id": aid})
+        db.clear_cache()
+        assert ach.get_achievement(aid, target)["counted"], label
+
+    broken("contest", "title = ''", "пустые поля")                  # название
+    broken("ip", "details = '{}'", "Номер документа")               # номер документа/заявки
+    broken("grant.app", "details = '{\"project\": \"П\"}'", "Статус заявки")       # статус заявки
+    broken("grant.app", "details = '{\"status\": \"подана\"}'", "Название проекта")  # проект
+    broken("grant.app", "details = '{\"project\": \"П\", \"status\": \"не поддержана\"}'", "Статус заявки")
+    broken("funded", "details = '{}'", "Источник")                  # источник
+    broken("agreement", "details = '{}'", "Номер и дата соглашения")
+    broken("publication", "title = ''", "пустые поля")
+    # уровень из чужого показателя (I01-строка у выставки) не считается
+    broken("expo", f"row_id = {R('I01.ru')}", "не относится")
+    # владелец не выбран у личного вида
+    broken("prize", "owner_id = NULL", "укажите участника")
+    # без даты запись не попадает ни в один год: предупреждение в отчёте любого года и в todo
+    aid = ids["edu"][0]
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET date_from = NULL, date_to = NULL WHERE id = :i"), {"i": aid})
+    db.clear_cache()
+    assert any(w["id"] == aid and "нет даты" in w["issues"] for w in ach.report_data(2026, db_path=target)["warnings"])
+    assert any(w["id"] == aid for w in ach.report_data(2025, db_path=target)["warnings"])
+    assert aid in {r["id"] for r in todo.list_todo(year=2026, db_path=target)}
+    assert "no_date" in next(r for r in todo.list_todo(db_path=target) if r["id"] == aid)["problem_codes"]
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET date_from = :d WHERE id = :i"), {"i": aid, "d": Y})
+    db.clear_cache()
+
+    # проверки при сохранении: уровень не от того показателя, год-опечатка
+    for bad, needle in (({**ids["expo"][1], "row_id": R("I01.ru")}, "не относится"),
+                        ({**ids["edu"][1], "date_from": "0202-05-05"}, "опечатка"),
+                        ({**ids["edu"][1], "date_from": "2206-05-05"}, "опечатка")):
+        try:
+            ach.save_achievement(bad, admin, db_path=target)
+            raise AssertionError(bad)
+        except ValueError as e:
+            assert needle in str(e), str(e)
+    # публикация без доли и без журнала: остаётся в отчёте с предупреждением (мягкое правило)
+    pid = ach.save_achievement({**ids["publication"][1], "title": "Без журнала", "number": "Р-Н-950-26",
+                                "owner_share": 100}, admin, db_path=target)["id"]
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET details = '{\"year\": 2026}' WHERE id = :i"), {"i": pid})
+    db.clear_cache()
+    p = ach.get_achievement(pid, target)
+    assert p["counted"] and any("журнал" in i for i in p["issues"])
+    # «Мои достижения»: save_achievement сообщает, считается ли запись
+    assert ach.save_achievement({**ids["edu"][1], "title": "Без номера 2"}, admin, db_path=target)["counted"] is False
+    print(f"  report gate OK ({len(cases)} видов/подпунктов: без номера не считается и даёт предупреждение; "
+          "исключения agreement/sno_contest/funded/без владельца; пустые поля, чужой уровень, без даты, "
+          "заглушки номера, дубль номера)")
 
 
 # ── 1. Бэкап ────────────────────────────────────────────────────────────────
@@ -482,5 +665,6 @@ def run_all(fresh) -> None:  # noqa: ANN001
     """fresh(): новая пустая база (SQLite-файл или очищенная Postgres)."""
     run_audit(fresh())
     run_todo(fresh())
+    run_report_gate(fresh())
     run_backup(fresh(), fresh())
     run_ui(fresh())
