@@ -1203,8 +1203,8 @@ def title_match(a: str, b: str) -> Optional[dict]:
     if not ka or not kb:
         return None
     na, nb = _title_numbers(a), _title_numbers(b)
-    if na and nb and na != nb:
-        return None
+    if na and nb and not (na <= nb or nb <= na):
+        return None   # «XV» и «XVI», «2024» и «2025» - разные; а «… XIII» и «… XIII (ИТНО 2025)» - то же самое
     if ka == kb:
         return {"kind": "same", "score": 1.0}
     ratio = SequenceMatcher(None, ka, kb).ratio()
