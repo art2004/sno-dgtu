@@ -1,4 +1,4 @@
-"""Smoke tests: поиск по своим работам и возможные дубли мероприятий.
+"""Smoke tests: поиск по своим работам, возможные дубли мероприятий, отчёт «Не заходили и ничего не вносили».
 Вызываются из smoke_test.py (SQLite по умолчанию, Postgres через SMOKE_DATABASE_URL)."""
 
 from __future__ import annotations
@@ -431,6 +431,111 @@ def run_ui(target) -> None:  # noqa: ANN001
           "своё название, «Не дубль» и возврат)")
 
 
+def run_inactive(target) -> None:  # noqa: ANN001
+    import io
+
+    import openpyxl
+    from streamlit.testing.v1 import AppTest
+
+    import inactive
+
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    mk = lambda login, name: db.create_user(login, "pass12345", name, db_path=target)  # noqa: E731
+    a = mk("ia", "Неактивный Антон")                 # не входил, ничего не внёс
+    b = mk("ib", "Ёлкин Борис")                      # входил, ничего не внёс
+    c = mk("ic", "Внесов Виктор")                    # не входил, но запись есть (внёс админ)
+    d = mk("id", "Отключённый Дмитрий")              # не входил, ничего, но отключён
+    h = mk("ih", "Журнальный Игорь")                 # входил до появления last_login: есть только запись в журнале
+    g = mk("ig", "Старов Глеб")                      # только старое участие (до достижений)
+    db.update_user(d, active=False, acting_user_id=admin["id"], db_path=target)
+    _doklad(target, c, "Конференция для неактивных", "2026-02-02")
+    db.add_participation_ex(g, "Старая конференция", "конференция", "2026-01-15", db_path=target)
+    db.init_db(db_path=target)
+    assert db.touch_last_login(b, db_path=target)
+    audit.log("login", actor={"id": h, "login": "ih", "full_name": "Журнальный Игорь"}, entity="user", entity_id=h,
+              db_path=target)
+    db.clear_cache()
+    # колонка last_login есть, у старых пользователей пустая
+    assert "last_login" in db.list_users(db_path=target)[0]
+    by = {r["login"]: r for r in db.list_user_activity(target)}
+    assert by["ia"]["last_login"] is None and by["ia"]["records"] == 0
+    assert by["ib"]["last_login"] and by["ib"]["records"] == 0
+    assert by["ic"]["last_login"] is None and by["ic"]["records"] == 1
+    assert by["ih"]["last_login"] and by["ig"]["records"] == 1             # перенесённое участие считается один раз
+    names = lambda **kw: sorted(r["login"] for r in inactive.list_inactive(db_path=target, **kw))  # noqa: E731
+    assert names() == ["ia"]                                              # по умолчанию: не заходили и ничего не внесли
+    assert not by["id"]["active"] and names(hide_disabled=False) == ["ia", "id"]
+    assert "admin" in names(hide_admins=False)
+    assert sorted(r["login"] for r in inactive.list_inactive("no_login", db_path=target)) == ["ia", "ic", "ig"]
+    assert sorted(r["login"] for r in inactive.list_inactive("no_records", db_path=target)) == ["ia", "ib", "ih"]
+    # отметка входа по cookie не чаще раза в интервал
+    assert not db.touch_last_login(b, min_gap_seconds=3600, db_path=target)
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE users SET last_login = '2020-01-01T10:00:00' WHERE id = :i"), {"i": b})
+    assert db.touch_last_login(b, min_gap_seconds=3600, db_path=target)
+    # выгрузки
+    recs = inactive.list_inactive("no_login", db_path=target)
+    ws = openpyxl.load_workbook(io.BytesIO(inactive.build_xlsx(recs, inactive.MODES["no_login"]))).active
+    rows = list(ws.iter_rows(values_only=True))
+    assert list(rows[0]) == inactive.COLUMNS and len(rows) == 1 + len(recs) and rows[1][1] in ("ia", "ic", "ig")
+    csv = inactive.build_csv(recs)
+    assert csv.startswith("\ufeff".encode("utf-8")) and "Неактивный Антон".encode("utf-8") in csv
+    # миграция: база без колонки last_login (старая версия) получает её при запуске, данные целы
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("ALTER TABLE users DROP COLUMN last_login"))
+    db.init_db(db_path=target)
+    db.clear_cache()
+    assert "last_login" in db.list_users(db_path=target)[0] and len(db.list_users(db_path=target)) >= 7
+    db.init_db(db_path=target)                       # повторный запуск безопасен
+    assert all(r["last_login"] is None for r in db.list_users(db_path=target) if r["login"] == "ib")   # у старых пусто
+    assert db.touch_last_login(b, db_path=target)
+    # интерфейс: вход через форму ставит last_login, вкладка админа показывает список и выгрузки
+    old_url, old_pw = os.environ.get("DATABASE_URL"), os.environ.get("ADMIN_PASSWORD")
+    os.environ["DATABASE_URL"] = str(db.resolve_url(target))
+    os.environ.pop("ADMIN_PASSWORD", None)
+    cwd = os.getcwd()
+    os.chdir(str(ROOT))
+    try:
+        at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120).run()
+        at.text_input[0].input("ia")
+        at.text_input[1].input("pass12345")
+        at.button[0].click().run()
+        assert not at.exception, at.exception
+        db.clear_cache()
+        assert db.get_user_by_id(a, target)["last_login"]
+        assert "ia" not in names()                                         # теперь заходил
+        ad = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
+        ad.session_state["user"] = {"id": admin["id"], "login": admin["login"], "full_name": admin["full_name"],
+                                    "role": "admin"}
+        ad.run()
+        assert not ad.exception, ad.exception
+        assert "Не заходили и ничего не вносили" in [t.label for t in ad.tabs]
+        assert any(x.value == "Не заходили и ничего не вносили" for x in ad.subheader)
+        assert [x.value for x in ad.metric if x.label == "Участников в списке"] == ["0"]
+        ad.radio(key="ina_mode").set_value("no_login").run()
+        assert not ad.exception, ad.exception
+        assert [x.value for x in ad.metric if x.label == "Участников в списке"] == ["2"]    # ic, ig (ia уже вошёл)
+        df = next(x.value for x in ad.dataframe if "Последний вход (МСК)" in x.value.columns)
+        assert sorted(df["Логин"]) == ["ic", "ig"] and list(df["Записей"]) == [1, 1]
+        ad.radio(key="ina_mode").set_value("no_records").run()
+        df = next(x.value for x in ad.dataframe if "Последний вход (МСК)" in x.value.columns)
+        assert sorted(df["Логин"]) == ["ia", "ib", "ih"] and all(df["Последний вход (МСК)"])
+        ad.checkbox(key="ina_adm").set_value(False).run()
+        df = next(x.value for x in ad.dataframe if "Последний вход (МСК)" in x.value.columns)
+        assert "admin" in list(df["Логин"])
+        assert not ad.exception, ad.exception
+    finally:
+        os.chdir(cwd)
+        for k, v in (("DATABASE_URL", old_url), ("ADMIN_PASSWORD", old_pw)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("  «Не заходили и ничего не вносили» OK (колонка last_login и миграция, вход ставит дату, журнал как запасной "
+          "источник, режимы, отключённые/админы, xlsx и csv, вкладка)")
+
+
 def run_all(fresh) -> None:  # noqa: ANN001
     """fresh(): новая пустая база (SQLite-файл или очищенная Postgres)."""
     run_title_rules()
@@ -439,6 +544,7 @@ def run_all(fresh) -> None:  # noqa: ANN001
     run_merge_custom(fresh())
     run_not_dup(fresh())
     run_ui(fresh())
+    run_inactive(fresh())
 
 
 if __name__ == "__main__":

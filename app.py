@@ -36,7 +36,7 @@ def _engine():
 
 # Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
 # push without restarting the process, so a cached init would never re-run.
-SCHEMA_VERSION = "2026-10-01-v5-audit-log"
+SCHEMA_VERSION = "2026-10-02-v6-event-dups-last-login"
 
 
 @st.cache_resource(show_spinner="Подключение к базе данных…")
@@ -83,6 +83,7 @@ def _ensure_session() -> None:
         user = auth.user_from_token(st.context.cookies.get(auth.COOKIE_NAME))
         if user is not None:
             st.session_state.user = _session_user(user)
+            db.touch_last_login(user["id"], min_gap_seconds=3600)  # вход по cookie: не чаще раза в час
     elif st.session_state.user is not None:
         # Role/name/login changed by an admin take effect on the next rerun;
         # a deleted or disabled account is logged out.
@@ -247,6 +248,7 @@ def render_login() -> None:
                 else:
                     st.session_state.user = _session_user(user)
                     st.session_state.pop("_cookie_logged_out", None)
+                    db.touch_last_login(user["id"])
                     audit.log("login", actor=user, entity="user", entity_id=user["id"],
                               summary=f"Вход: {user['full_name']} (@{user['login']})")
                     _queue_auth_cookie(user["id"])
@@ -1102,7 +1104,7 @@ def _backup_section() -> None:
 def admin_panel(user: dict) -> None:
     st.title("Панель лидера СНО")
     tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Дубли мероприятий", "Отчёт",
-                    "Все достижения", "Что дозаполнить", "Журнал", "Настройки"])
+                    "Все достижения", "Что дозаполнить", "Не заходили и ничего не вносили", "Журнал", "Настройки"])
     with tabs[0]:
         admin_members(user)
     with tabs[1]:
@@ -1118,8 +1120,10 @@ def admin_panel(user: dict) -> None:
     with tabs[6]:
         ua.admin_todo(user, _year_choices(include_all=True), _year_label)
     with tabs[7]:
-        ua.admin_audit_log()
+        ua.admin_inactive()
     with tabs[8]:
+        ua.admin_audit_log()
+    with tabs[9]:
         admin_settings()
 
 

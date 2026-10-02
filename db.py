@@ -19,7 +19,7 @@ import threading
 import os
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -300,7 +300,8 @@ _SCHEMA = [
         full_name TEXT NOT NULL,
         role TEXT NOT NULL CHECK(role IN ('admin', 'member')),
         created_at TEXT NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1
+        active INTEGER NOT NULL DEFAULT 1,
+        last_login TEXT
     )
     """,
     """
@@ -403,6 +404,7 @@ def _create_schema(db_path: DbTarget = None) -> None:
 # Columns added after the first release: (table, column, DDL type). Added with
 # ALTER TABLE ... ADD COLUMN only when missing → idempotent, data untouched.
 _ADDED_COLUMNS = [
+    ("users", "last_login", "TEXT"),
     ("events", "article_topic", "TEXT"),
     ("events", "indexing", "TEXT"),
     ("participations", "achievement_number", "TEXT"),
@@ -617,7 +619,7 @@ def list_users(
     role: Optional[str] = None,
     db_path: DbTarget = None,
 ) -> list[dict]:
-    sql = "SELECT id, login, full_name, role, created_at, active FROM users WHERE 1=1"
+    sql = "SELECT id, login, full_name, role, created_at, active, last_login FROM users WHERE 1=1"
     params: dict[str, Any] = {}
     if active_only:
         sql += " AND active = 1"
@@ -627,6 +629,57 @@ def list_users(
     sql += " ORDER BY role DESC, LOWER(full_name)"
     with get_engine(db_path).connect() as conn:
         return _rows(conn.execute(text(sql), params))
+
+
+def _now_msk() -> str:
+    """Московское время (UTC+3, без перехода на летнее) - как в журнале действий."""
+    return datetime.now(timezone(timedelta(hours=3))).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def touch_last_login(user_id: int, min_gap_seconds: int = 0, db_path: DbTarget = None) -> bool:
+    """Запомнить время входа (users.last_login, МСК). min_gap_seconds > 0 - не чаще раза в этот срок
+    (для входа по cookie при обновлении страницы). Возвращает True, если записано. Сбой не критичен."""
+    now = _now_msk()
+    try:
+        with get_engine(db_path).begin() as conn:
+            if min_gap_seconds > 0:
+                last = conn.execute(text("SELECT last_login FROM users WHERE id = :id"), {"id": user_id}).scalar()
+                if last:
+                    try:
+                        age = (datetime.fromisoformat(now) - datetime.fromisoformat(str(last))).total_seconds()
+                    except ValueError:
+                        age = min_gap_seconds
+                    if age < min_gap_seconds:
+                        return False
+            return conn.execute(text("UPDATE users SET last_login = :t WHERE id = :id"),
+                                {"t": now, "id": user_id}).rowcount > 0
+    except Exception as exc:  # noqa: BLE001 - вход не должен ломаться из-за этой отметки
+        import sys
+        print(f"touch_last_login failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        return False
+
+
+def list_user_activity(db_path: DbTarget = None) -> list[dict]:
+    """Все пользователи с признаками активности: last_login (из users.last_login, а если пусто - из
+    последней записи «Вход» в журнале), records (свои достижения + соавторство + участия, ещё не
+    перенесённые в достижения). Для отчёта «Не заходили и ничего не вносили»."""
+    with get_engine(db_path).connect() as conn:
+        rows = _rows(conn.execute(text(
+            "SELECT u.id, u.login, u.full_name, u.role, u.active, u.created_at, u.last_login, "
+            "(SELECT MAX(l.ts) FROM audit_log l WHERE l.action = 'login' AND l.actor_id = u.id) AS audit_login, "
+            "(SELECT COUNT(*) FROM achievements a WHERE a.owner_id = u.id) AS n_own, "
+            "(SELECT COUNT(*) FROM achievement_people ap WHERE ap.user_id = u.id AND ap.sort_order >= 0 "
+            "   AND ap.name <> '') AS n_co, "
+            "(SELECT COUNT(*) FROM participations p WHERE p.user_id = u.id "
+            "   AND NOT EXISTS (SELECT 1 FROM achievements a2 WHERE a2.legacy_pid = p.id) "
+            "   AND NOT EXISTS (SELECT 1 FROM achievement_people ap2 WHERE ap2.legacy_pid = p.id)) AS n_part "
+            "FROM users u")))
+    for r in rows:
+        logins = [x for x in (r["last_login"], r["audit_login"]) if x]
+        r["last_login"] = max(str(x) for x in logins) if logins else None
+        r["records"] = int(r["n_own"]) + int(r["n_co"]) + int(r["n_part"])
+    rows.sort(key=lambda r: (r["full_name"] or "").casefold())
+    return rows
 
 
 class AdminGuardError(ValueError):

@@ -772,6 +772,40 @@ def admin_event_dups(acting: dict) -> None:
                     st.rerun()
 
 
+# ── Admin: «Не заходили и ничего не вносили» ────────────────────────────────
+
+
+def admin_inactive() -> None:
+    import pandas as pd
+
+    import inactive
+
+    st.subheader("Не заходили и ничего не вносили")
+    st.caption("Участники, которые ни разу не входили на сайт и не внесли ни одного достижения (свои записи, "
+               "соавторство или старые участия). Дата последнего входа запоминается с момента появления этого "
+               "отчёта; для более ранних входов используется журнал действий, у остальных она пустая.")
+    c1, c2, c3 = st.columns([3, 2, 2])
+    mode = c1.radio("Кого показать", list(inactive.MODES), format_func=inactive.MODES.get, key="ina_mode",
+                    help="Основной вариант - первый. Остальные полезны, если записи за участника вносил админ "
+                         "или участник заходил, но так ничего и не добавил.")
+    hide_dis = c2.checkbox("Скрыть отключённых", value=True, key="ina_dis")
+    hide_adm = c3.checkbox("Скрыть админов", value=True, key="ina_adm")
+    recs = inactive.list_inactive(mode, hide_disabled=hide_dis, hide_admins=hide_adm)
+    st.metric("Участников в списке", len(recs))
+    if not recs:
+        st.success("По выбранному критерию никого нет.")
+        return
+    table = pd.DataFrame(inactive.rows_for_export(recs), columns=inactive.COLUMNS)
+    st.dataframe(table, hide_index=True, width="stretch")
+    d1, d2, _ = st.columns([2, 2, 4])
+    d1.download_button("⬇️ Выгрузить в Excel (.xlsx)", data=inactive.build_xlsx(recs, inactive.MODES[mode]),
+                       file_name="Не_заходили_и_ничего_не_вносили.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       type="primary", key="ina_xlsx")
+    d2.download_button("⬇️ Выгрузить в CSV", data=inactive.build_csv(recs),
+                       file_name="Не_заходили_и_ничего_не_вносили.csv", mime="text/csv", key="ina_csv")
+
+
 # ── Admin: «Журнал» ─────────────────────────────────────────────────────────
 
 
