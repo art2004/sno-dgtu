@@ -36,7 +36,7 @@ FORMAT_VERSION = 1
 
 # Порядок: родители раньше детей (внешние ключи). Восстановление удаляет в обратном порядке.
 TABLE_ORDER = [
-    "users", "events", "participations", "meetings", "settings",
+    "users", "events", "participations", "event_not_dup", "meetings", "settings",
     "indicators", "indicator_rows", "kinds", "kind_subpoints",
     "achievements", "achievement_people", "audit_log",
 ]

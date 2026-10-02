@@ -45,6 +45,9 @@ ACTION_LABELS = {
     "meeting_create": "Заседание: создание",
     "meeting_update": "Заседание: изменение",
     "meeting_delete": "Заседание: удаление",
+    "events_merge": "Мероприятия: объединение дублей",
+    "events_not_dup": "Мероприятия: «не дубль»",
+    "events_not_dup_undo": "Мероприятия: «не дубль» отменено",
     "backup_download": "Скачивание бэкапа",
     "backup_restore": "Восстановление из бэкапа",
 }

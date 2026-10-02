@@ -31,7 +31,7 @@ from auth import authenticate, change_password, hash_password, verify_password  
 def _reset_pg(target: str) -> None:
     with db.get_engine(target).begin() as conn:
         conn.execute(text(
-            "DROP TABLE IF EXISTS achievement_people, achievements, kind_subpoints, kinds, "
+            "DROP TABLE IF EXISTS event_not_dup, achievement_people, achievements, kind_subpoints, kinds, "
             "indicator_rows, indicators, participations, events, users, meetings, settings, audit_log CASCADE"
         ))
 
@@ -771,6 +771,10 @@ def main() -> None:
 
         _reset_pg(pg_url)
         smoke_features.run_all(_fresh_pg)
+        import smoke_events
+
+        _reset_pg(pg_url)
+        smoke_events.run_all(_fresh_pg)
         _reset_pg(pg_url)
         print("OK (Postgres)")
         return
@@ -786,6 +790,9 @@ def main() -> None:
 
     counter = iter(range(1000))
     smoke_features.run_all(lambda: tmp.with_name(f"sno_feat_{next(counter)}.db"))
+    import smoke_events
+
+    smoke_events.run_all(lambda: tmp.with_name(f"sno_ev_{next(counter)}.db"))
     print("OK")
     print(f"  smoke db: {tmp}")
 

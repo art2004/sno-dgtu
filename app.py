@@ -1101,8 +1101,8 @@ def _backup_section() -> None:
 
 def admin_panel(user: dict) -> None:
     st.title("Панель лидера СНО")
-    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Отчёт", "Все достижения",
-                    "Что дозаполнить", "Журнал", "Настройки"])
+    tabs = st.tabs(["Участники", "Статистика", "Заседания и мероприятия", "Дубли мероприятий", "Отчёт",
+                    "Все достижения", "Что дозаполнить", "Журнал", "Настройки"])
     with tabs[0]:
         admin_members(user)
     with tabs[1]:
@@ -1110,14 +1110,16 @@ def admin_panel(user: dict) -> None:
     with tabs[2]:
         admin_meetings()
     with tabs[3]:
-        admin_report()
+        ua.admin_event_dups(user)
     with tabs[4]:
-        ua.admin_achievements(user, _year_choices(include_all=True), _year_label)
+        admin_report()
     with tabs[5]:
-        ua.admin_todo(user, _year_choices(include_all=True), _year_label)
+        ua.admin_achievements(user, _year_choices(include_all=True), _year_label)
     with tabs[6]:
-        ua.admin_audit_log()
+        ua.admin_todo(user, _year_choices(include_all=True), _year_label)
     with tabs[7]:
+        ua.admin_audit_log()
+    with tabs[8]:
         admin_settings()
 
 

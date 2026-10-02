@@ -1385,6 +1385,38 @@ def list_achievements(owner_id: Optional[int] = None, year: Optional[int] = None
     return recs
 
 
+def _text_key(value: Any) -> str:
+    """Для поиска по тексту: регистр не важен, ё = е, пробелы схлопнуты."""
+    return " ".join(str(value or "").casefold().replace("ё", "е").split())
+
+
+def _number_key(value: Any) -> str:
+    """Номер без пробелов, дефисов, точек и знака «№»: «Р-Н 123/26» ~ «рн12326»."""
+    return re.sub(r"[\s\-\u2010-\u2015_.,/\\№#]+", "", _text_key(value))
+
+
+def search_records(recs: list[dict], query: str) -> list[dict]:
+    """Поиск по своим работам: номер достижения (портфолио) и название (в т.ч. тема доклада, т.к. при
+    импорте из ЛК название работы лежит в «теме»). Подстрока без учёта регистра, ё = е; несколько слов -
+    запись должна содержать каждое (в любом порядке). Пустой запрос возвращает всё."""
+    words = [w for w in _text_key(query).split() if any(ch.isalnum() for ch in w)]
+    if not words:
+        return list(recs)
+    out = []
+    for r in recs:
+        hay = _text_key(" ".join(str(r.get(k) or "") for k in ("title", "topic")))
+        num = _number_key(r.get("number"))
+        for w in words:
+            if not any(ch.isalnum() for ch in w):  # одинокий «№», «-» и т.п. не ищем
+                continue
+            wn = _number_key(w)
+            if w not in hay and not (wn and wn in num):
+                break
+        else:
+            out.append(r)
+    return out
+
+
 def has_number(r: dict) -> bool:
     """Номер действительно указан: не пусто, не заглушка («нет», «-», «б/н») и есть хотя бы одна цифра."""
     v = re.sub(r"\s+", "", str(r.get("number") or "")).upper()
@@ -1568,6 +1600,76 @@ def events_overview(year: Optional[int] = None, db_path: DbTarget = None,
             g.pop("names", None)
     out.sort(key=lambda g: (g["date"] or "", g["title"].lower()), reverse=True)
     return out
+
+
+# ── Возможные дубли мероприятий: действия админа (с записью в журнал) ────────
+
+
+def _ev_line(e: dict) -> str:
+    return f"«{audit._short(e['title'], 60)}» ({fmt_date(e['event_date'])})"
+
+
+def merge_event_group(event_ids: list[int], title: str, event_date: Any, db_path: DbTarget = None,
+                      audit_ctx: Optional[dict] = None) -> dict:
+    """Объединить мероприятия под одним названием и датой (db.merge_events) + запись в журнал.
+    Записи участников, номера и доли сохраняются; ошибки - ValueError с русским текстом."""
+    ids = sorted({int(i) for i in event_ids})
+    with _eng(db_path).connect() as conn:
+        marks = ", ".join(f":e{i}" for i in range(len(ids)))
+        old = _rows(conn.execute(text(f"SELECT id, title, event_date FROM events WHERE id IN ({marks})"),
+                                 {f"e{i}": v for i, v in enumerate(ids)})) if ids else []
+    res = db.merge_events(ids, title, event_date, db_path=db_path)
+    try:
+        ctx = audit_ctx or {}
+        d = _iso(event_date)
+        audit.log("events_merge", ctx.get("actor"), ctx.get("as_user"), None, "event", res["event_id"],
+                  f"Объединено мероприятий: {len(old)} в «{audit._short(' '.join(title.split()), 80)}» ({fmt_date(d)}); "
+                  f"записей участников перенесено: {res['achievements']}; было: " + "; ".join(_ev_line(e) for e in old),
+                  {"before": [{"id": e["id"], "title": e["title"], "date": str(e["event_date"])[:10]} for e in old],
+                   "after": {"id": res["event_id"], "title": " ".join(title.split()), "date": d},
+                   "achievements": res["achievements"], "participations_merged": res["participations_merged"]},
+                  db_path)
+    except Exception as exc:  # noqa: BLE001 - журнал не должен ломать основную операцию
+        import sys
+        print(f"audit hook failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    return res
+
+
+def mark_events_not_dup(event_ids: list[int], acting_user: dict, db_path: DbTarget = None,
+                        audit_ctx: Optional[dict] = None) -> int:
+    """«Не дубль»: пары из этой группы больше не предлагаются; пишет в журнал."""
+    ids = sorted({int(i) for i in event_ids})
+    n = db.mark_not_duplicate(ids, acting_user.get("id"), db_path)
+    try:
+        ctx = audit_ctx or {"actor": acting_user, "as_user": None}
+        with _eng(db_path).connect() as conn:
+            marks = ", ".join(f":e{i}" for i in range(len(ids)))
+            evs = _rows(conn.execute(text(f"SELECT id, title, event_date FROM events WHERE id IN ({marks})"),
+                                     {f"e{i}": v for i, v in enumerate(ids)})) if ids else []
+        audit.log("events_not_dup", ctx.get("actor"), ctx.get("as_user"), None, "event", ids[0] if ids else None,
+                  "Не дубль: " + "; ".join(_ev_line(e) for e in evs),
+                  {"events": [e["id"] for e in evs], "pairs_hidden": n}, db_path)
+    except Exception as exc:  # noqa: BLE001
+        import sys
+        print(f"audit hook failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    return n
+
+
+def unmark_event_not_dup(pair_id: int, acting_user: dict, db_path: DbTarget = None,
+                         audit_ctx: Optional[dict] = None) -> bool:
+    """Вернуть скрытую пару «не дубль» в список возможных дублей; пишет в журнал."""
+    pair = next((p for p in db.list_not_duplicates(db_path) if p["id"] == int(pair_id)), None)
+    done = db.unmark_not_duplicate(pair_id, db_path)
+    if done and pair:
+        try:
+            ctx = audit_ctx or {"actor": acting_user, "as_user": None}
+            audit.log("events_not_dup_undo", ctx.get("actor"), ctx.get("as_user"), None, "event", pair["a_id"],
+                      f"Пара снова считается возможным дублем: «{audit._short(pair['a_title'], 60)}» и "
+                      f"«{audit._short(pair['b_title'], 60)}»", {"pair": [pair["a_id"], pair["b_id"]]}, db_path)
+        except Exception as exc:  # noqa: BLE001
+            import sys
+            print(f"audit hook failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    return done
 
 
 @db.cached

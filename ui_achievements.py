@@ -17,6 +17,7 @@ import db
 import ru_text
 
 RECORD_FORMS = ("запись", "записи", "записей")
+EVENT_FORMS = ("мероприятие", "мероприятия", "мероприятий")
 
 NONE = 0
 EXTERNAL = "— не из СНО —"
@@ -311,11 +312,45 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
                                                  exclude_id=record["id"] if record else None)
             if dup:
                 st.warning(ach.duplicate_message(dup, owner_id))
+    if kind["code"] in ach.EVENT_KINDS:
+        _similar_events_hint(pfx, kind, record)
     if form == "doklad" and not ss.get(f("ochno"), True):
         st.caption("Заочный доклад сохранится, но в годовой отчёт не попадёт.")
     st.button("Сохранить изменения" if record else "Сохранить", type="primary", key=_k(pfx, "save"),
               on_click=_save_cb, args=(pfx, acting, record["id"] if record else None, form))
     show_msgs(_k(pfx, "msg"))
+
+
+def _pick_event_cb(pfx: str, title: str, event_date: str) -> None:
+    """«Выбрать это»: подставить название и дату уже внесённого мероприятия - запись попадёт в него."""
+    ss = st.session_state
+    ss[_k(pfx, "f_title")] = title
+    ss[_k(pfx, "f_date_from")] = date.fromisoformat(event_date[:10])
+
+
+def _similar_events_hint(pfx: str, kind: dict, record: Optional[dict]) -> None:
+    """Предупреждение «Похоже на уже внесённое»: то же мероприятие, написанное иначе или с другой датой.
+    Расширяет общий поиск мероприятия (title_norm + тип + дата): здесь ищутся не точные, а похожие."""
+    ss = st.session_state
+    title = (ss.get(_k(pfx, "f_title")) or "").strip()
+    when = ss.get(_k(pfx, "f_date_from"))
+    if not title or not when:
+        return
+    cands = db.find_similar_events(title, ach.EVENT_KINDS[kind["code"]], when,
+                                   exclude_event_id=record["event_id"] if record else None)
+    if not cands:
+        return
+    with st.container(border=True):
+        st.warning("Похоже на уже внесённое: возможно, это то же мероприятие, записанное по-другому. "
+                   "Если оно то же - выберите его ниже, тогда ваша запись попадёт в общее мероприятие "
+                   "(без дубля в отчёте). Если мероприятие другое - просто сохраняйте как есть.")
+        for c in cands[:5]:
+            a, b = st.columns([6, 2], vertical_alignment="center")
+            a.markdown(f"**{c['title']}**  \n{ach.fmt_date(c['event_date'])} · {c['reason']}"
+                       + (f" · уже внесено записей: {c['records']}" if c["records"] else ""))
+            b.button("Выбрать это", key=_k(pfx, f"pick_ev_{c['event_id']}"), on_click=_pick_event_cb,
+                     args=(pfx, c["title"], c["event_date"]),
+                     help="Подставит название и дату этого мероприятия в вашу запись")
 
 
 def _authors_block(pfx: str, names: dict, owner_id: Optional[int], acting: dict, is_admin: bool) -> None:
@@ -403,8 +438,19 @@ def member_list(user: dict) -> None:
     if todo:
         st.warning(f"Требуют заполнения: {len(todo)} — отмечены значком «⚠ заполните». "
                    "Без уровня/подпункта запись не попадёт в годовой отчёт.")
+    q = st.text_input("🔍 Поиск по моим работам", key="mine_q",
+                      placeholder="номер достижения или название (можно часть слова)",
+                      help="Ищет среди ваших записей по номеру достижения (из личного кабинета) и по названию "
+                           "работы или мероприятия. Регистр и буква «ё» не важны; несколько слов - "
+                           "запись должна содержать каждое.")
+    shown = ach.search_records(recs, q)
+    if (q or "").strip():
+        st.caption(f"Найдено {len(shown)} из {len(recs)}")
+        if not shown:
+            st.info("По вашему запросу ничего не найдено. Проверьте номер или название либо очистите поле поиска.")
+            return
     groups: dict[str, list[dict]] = {}
-    for r in recs:
+    for r in shown:
         groups.setdefault(r["kind_label"], []).append(r)
     for label, items in groups.items():
         st.markdown(f"##### {label} ({len(items)})")
@@ -614,6 +660,116 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
             with st.container(border=True):
                 achievement_form(f"td{rid}_", acting, record=r)
     st.caption("Подсказка: после сохранения запись исчезает из списка, если всё заполнено.")
+
+
+# ── Admin: «Дубли мероприятий» ──────────────────────────────────────────────
+
+OWN_TITLE = 0  # в выборе «что оставить»: ввести своё название и дату
+
+
+def _event_people_line(recs: list[dict], limit: int = 6) -> str:
+    items = [f"{r['owner']}" + (f" (№ {r['number']})" if r.get("number") else " (без номера)") for r in recs]
+    if not items:
+        return "записей нет"
+    more = f" и ещё {len(items) - limit}" if len(items) > limit else ""
+    return "внесли: " + "; ".join(items[:limit]) + more
+
+
+def admin_event_dups(acting: dict) -> None:
+    """Группы похожих мероприятий (db.list_duplicate_groups): объединить под одним названием и датой
+    или пометить «не дубль». Объединение - одна транзакция, записи участников не теряются."""
+    ss = st.session_state
+    st.subheader("Возможные дубли мероприятий")
+    st.caption("Участники вносят одно мероприятие по-разному: название короче или с другими кавычками, дата "
+               "на день-два раньше или позже. Здесь такие мероприятия собраны в группы. Мероприятия разных "
+               "типов и разных лет за дубли не считаются. «Объединить» переносит все записи участников "
+               "(номера достижений и доли сохраняются) на одно мероприятие с выбранным названием и датой.")
+    show_msgs("evd_msg")
+    days = int(st.slider("Допустимая разница в датах, дней", 0, db.DUP_MAX_DAYS, db.DUP_DAYS_ADMIN, key="evd_days",
+                         help="Мероприятия с похожими названиями и датами в этих пределах попадут в одну группу. "
+                              "Если дата совпала, а названия совпадают лишь частично - группа тоже показывается."))
+    groups = db.list_duplicate_groups(days)
+    st.caption(f"Найдено групп: {len(groups)}")
+    if not groups:
+        st.success("Похожих мероприятий не найдено.")
+    for gi, g in enumerate(groups, start=1):
+        gk = g["key"]
+        evs = {e["id"]: e for e in g["events"]}
+        with st.container(border=True):
+            st.markdown(f"**Группа {gi}: {len(evs)} {ru_text.plural(len(evs), EVENT_FORMS)}** "
+                        f"· {g['events'][0]['type']}")
+            st.caption("Почему похожи: " + "; ".join(g["reasons"]))
+            use: dict[int, bool] = {}
+            for e in g["events"]:
+                a, b = st.columns([1, 9], vertical_alignment="center")
+                use[e["id"]] = a.checkbox("объединять", value=True, key=f"evd_{gk}_use_{e['id']}",
+                                          label_visibility="collapsed",
+                                          help="Снимите галочку, чтобы не объединять это мероприятие с остальными")
+                b.markdown(f"**{e['title']}** - {ach.fmt_date(e['event_date'])} · {e['type']}  \n"
+                           + _event_people_line(e["records"]))
+            chosen = [i for i, on in use.items() if on]
+            owners: dict[str, int] = {}
+            for i in chosen:
+                for name in {r["owner"] for r in evs[i]["records"]}:
+                    owners[name] = owners.get(name, 0) + 1
+            twice = sorted(n for n, k in owners.items() if k > 1)
+            if twice:
+                st.info("Один участник внёс разные варианты: " + ", ".join(twice) + ". После объединения у него "
+                        "останутся обе записи (ничего не удаляется) - при желании удалите лишнюю во вкладке "
+                        "«Все достижения».")
+            best = max(chosen or list(evs), key=lambda i: (len(evs[i]["records"]), -i))
+            options = [*chosen, OWN_TITLE]
+            if ss.get(f"evd_{gk}_pick") not in options:
+                ss[f"evd_{gk}_pick"] = best if best in options else options[0]
+            pick = st.radio("Какое название и дату оставить", options, key=f"evd_{gk}_pick",
+                            format_func=lambda i: "Ввести своё название и дату" if i == OWN_TITLE
+                            else f"{evs[i]['title']} ({ach.fmt_date(evs[i]['event_date'])})")
+            if pick == OWN_TITLE:
+                c1, c2 = st.columns([3, 1])
+                ss.setdefault(f"evd_{gk}_title", evs[best]["title"])
+                ss.setdefault(f"evd_{gk}_date", date.fromisoformat(evs[best]["event_date"]))
+                new_title = c1.text_input("Название", key=f"evd_{gk}_title")
+                new_date = c2.date_input("Дата", key=f"evd_{gk}_date", format="DD.MM.YYYY")
+            else:
+                new_title, new_date = evs[pick]["title"], date.fromisoformat(evs[pick]["event_date"])
+            b1, b2, _ = st.columns([2, 1, 3])
+            if b1.button("Объединить под одним названием", type="primary", key=f"evd_{gk}_merge",
+                         disabled=len(chosen) < 2):
+                ss[f"evd_{gk}_confirm"] = True
+            if b2.button("Не дубль", key=f"evd_{gk}_nodup",
+                         help="Больше не предлагать объединять эти мероприятия"):
+                n = ach.mark_events_not_dup(list(evs), acting, audit_ctx=audit.who(ss))
+                ss["evd_msg"] = ("success", f"Готово: эти мероприятия больше не считаются дублями (скрыто пар: {n}).")
+                st.rerun()
+            if ss.get(f"evd_{gk}_confirm"):
+                st.warning(f"Объединить {ru_text.with_count(len(chosen), EVENT_FORMS)} в «{(new_title or '').strip()}» "
+                           f"({new_date.strftime('%d.%m.%Y') if new_date else '-'})? Записи участников сохранятся, "
+                           "название и дата у них станут такими же.")
+                y1, y2, _ = st.columns([1, 1, 4])
+                if y1.button("Да, объединить", type="primary", key=f"evd_{gk}_yes"):
+                    try:
+                        res = ach.merge_event_group(chosen, new_title, new_date, audit_ctx=audit.who(ss))
+                    except (ValueError, RuntimeError) as e:
+                        ss.pop(f"evd_{gk}_confirm", None)
+                        ss["evd_msg"] = ("error", str(e))
+                    else:
+                        ss.pop(f"evd_{gk}_confirm", None)
+                        ss["evd_msg"] = ("success", f"Объединено: {ru_text.with_count(len(chosen), EVENT_FORMS)} в одно. "
+                                                    f"Записей участников в нём: {res['achievements']} (все на месте).")
+                    st.rerun()
+                if y2.button("Отмена", key=f"evd_{gk}_cancel"):
+                    ss.pop(f"evd_{gk}_confirm", None)
+                    st.rerun()
+    hidden = db.list_not_duplicates()
+    if hidden:
+        with st.expander(f"Скрытые пары («не дубль»): {len(hidden)}"):
+            for h in hidden:
+                a, b = st.columns([8, 1], vertical_alignment="center")
+                a.markdown(f"{h['a_title']} ({ach.fmt_date(h['a_date'])}) и {h['b_title']} ({ach.fmt_date(h['b_date'])})")
+                if b.button("Вернуть", key=f"evd_unhide_{h['id']}", help="Снова считать эту пару возможным дублем"):
+                    ach.unmark_event_not_dup(h["id"], acting, audit_ctx=audit.who(ss))
+                    ss["evd_msg"] = ("success", "Пара снова считается возможным дублем.")
+                    st.rerun()
 
 
 # ── Admin: «Журнал» ─────────────────────────────────────────────────────────

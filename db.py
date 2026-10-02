@@ -19,7 +19,7 @@ import threading
 import os
 import re
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -327,6 +327,18 @@ _SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_participations_event ON participations(event_id)",
+    # Пары мероприятий, которые админ пометил «не дубль» (раздел «Возможные дубли мероприятий»):
+    # пара скрыта из подсказок. Строки уходят вместе с мероприятием (ON DELETE CASCADE).
+    """
+    CREATE TABLE IF NOT EXISTS event_not_dup (
+        id {pk},
+        event_a INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        event_b INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        created_by INTEGER,
+        UNIQUE(event_a, event_b)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS meetings (
         id {pk},
@@ -1089,6 +1101,372 @@ def update_event(
             ), {"topic": topic, "idx": idx, "dst": target})
         conn.execute(text("DELETE FROM events WHERE id = :src"), {"src": event_id})
         return {"event_id": target, "merged": True}
+
+
+# ── Возможные дубли мероприятий ─────────────────────────────────────────────
+# Общее мероприятие (events) однозначно определяется парой «нормализованное название +
+# тип + дата». Участники вносят одно и то же мероприятие по-разному (короче, с другими
+# кавычками, на пару дней раньше), и тогда получаются два мероприятия. Ниже - поиск таких
+# пар (для подсказки в форме и для админа) и безопасное объединение в одно.
+
+# Статьи, стипендии и гранты - не «мероприятия»: их названия не склеиваем.
+DUP_SKIP_TYPES = ("статья", "стипендия", "грант")
+DUP_RATIO = 0.8          # порог difflib для «похожего» названия
+DUP_LOOSE_RATIO = 0.65   # мягкий порог, когда дата совпадает
+DUP_DAYS_ADMIN = 3       # окно дат по умолчанию в админском разделе
+DUP_DAYS_FORM = 7        # окно дат для подсказки при внесении (мягкое, только предупреждение)
+DUP_MAX_DAYS = 30
+# слова, которые сами по себе не отличают одно мероприятие от другого
+_GENERIC_WORDS = frozenset(
+    "научная научно практическая международная всероссийская региональная студенческая молодежная "
+    "конференция форум конкурс олимпиада семинар круглый стол выставка школа неделя день "
+    "и в на по для о об с к а the of".split()
+)
+_ROMAN_RE = re.compile(r"\b[IVXХ]{1,6}\b")
+
+
+def title_key(title: str) -> str:
+    """Название для сравнения: регистр, ё=е, кавычки/тире/знаки препинания убраны, пробелы схлопнуты."""
+    s = (title or "").casefold().replace("ё", "е")
+    s = re.sub(r"[\W_]+", " ", s, flags=re.UNICODE)
+    return s.strip()
+
+
+def _title_numbers(title: str) -> set[str]:
+    """Числа и римские цифры из названия: «XV» и «XVI», «2024» и «2025» - разные мероприятия."""
+    nums = set(re.findall(r"\d+", title or ""))
+    nums |= {m.replace("Х", "X") for m in _ROMAN_RE.findall(title or "")}
+    return nums
+
+
+def title_match(a: str, b: str) -> Optional[dict]:
+    """Похожи ли названия. None или {'kind': 'same'|'fuzzy'|'contains'|'loose', 'score': 0..1}.
+    same - совпали после нормализации; fuzzy - difflib >= 0.8; contains - слова одного названия
+    целиком входят в другое (неполное название); loose - слабое сходство (используется только
+    при совпадающей дате)."""
+    from difflib import SequenceMatcher
+
+    ka, kb = title_key(a), title_key(b)
+    if not ka or not kb:
+        return None
+    na, nb = _title_numbers(a), _title_numbers(b)
+    if na and nb and na != nb:
+        return None
+    if ka == kb:
+        return {"kind": "same", "score": 1.0}
+    ratio = SequenceMatcher(None, ka, kb).ratio()
+    if ratio >= DUP_RATIO:
+        return {"kind": "fuzzy", "score": ratio}
+    wa, wb = ka.split(), kb.split()
+    short, long_ = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    if len(short) >= 2 and set(short) <= set(long_) and any(w not in _GENERIC_WORDS for w in short):
+        return {"kind": "contains", "score": max(ratio, len(short) / len(long_))}
+    sa, sb = set(wa) - _GENERIC_WORDS, set(wb) - _GENERIC_WORDS
+    jac = len(sa & sb) / len(sa | sb) if (sa | sb) else 0.0
+    if ratio >= DUP_LOOSE_RATIO or jac >= 0.5:
+        return {"kind": "loose", "score": max(ratio, jac)}
+    return None
+
+
+def similar_events(a: dict, b: dict, days: int = DUP_DAYS_ADMIN) -> Optional[dict]:
+    """Пара мероприятий (title, type, event_date) - возможный дубль? None или
+    {'score', 'days', 'reason'}. Правила: тот же тип; разные годы - разные мероприятия;
+    похожее название и даты в пределах ±days; либо та же дата и названия хотя бы частично совпадают."""
+    if a["type"] != b["type"]:
+        return None
+    try:
+        da, dbb = _to_date(a["event_date"]), _to_date(b["event_date"])
+    except ValueError:
+        return None
+    if da.year != dbb.year:
+        return None
+    delta = abs((da - dbb).days)
+    m = title_match(a["title"], b["title"])
+    if m is None or delta > max(days, 0):
+        return None
+    if m["kind"] == "loose":
+        if delta != 0:
+            return None
+        reason = "та же дата, названия частично совпадают"
+    elif m["kind"] == "contains":
+        reason = "одно название входит в другое" + ("" if delta == 0 else f", даты отличаются на {delta} дн.")
+    else:
+        reason = ("названия совпадают с точностью до написания" if m["kind"] == "same"
+                  else "очень похожие названия")
+        reason += ", одна дата" if delta == 0 else f", даты отличаются на {delta} дн."
+    return {"score": round(m["score"] - delta * 0.01, 4), "days": delta, "reason": reason}
+
+
+def _event_records(conn, ids: list[int]) -> dict[int, list[dict]]:  # noqa: ANN001
+    """Кто внёс мероприятия: [{owner, number, kind}] по event_id (для админа)."""
+    out: dict[int, list[dict]] = {i: [] for i in ids}
+    if not ids:
+        return out
+    names = [f"e{i}" for i in range(len(ids))]
+    params = dict(zip(names, ids))
+    marks = ", ".join(":" + n for n in names)
+    for r in conn.execute(text(
+            "SELECT a.event_id, a.id, a.number, a.date_from, u.full_name AS owner, k.label AS kind "
+            "FROM achievements a JOIN kinds k ON k.id = a.kind_id "
+            "LEFT JOIN users u ON u.id = a.owner_id "
+            f"WHERE a.event_id IN ({marks}) ORDER BY a.id"), params):
+        m = r._mapping
+        out[int(m["event_id"])].append({"id": m["id"], "owner": m["owner"] or "СНО", "number": m["number"],
+                                        "kind": m["kind"], "date": m["date_from"]})
+    # старые участия, которых ещё нет среди достижений
+    for r in conn.execute(text(
+            "SELECT p.event_id, p.id, p.achievement_number, u.full_name AS owner FROM participations p "
+            "JOIN users u ON u.id = p.user_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM achievements a WHERE a.legacy_pid = p.id) "
+            "AND NOT EXISTS (SELECT 1 FROM achievement_people ap WHERE ap.legacy_pid = p.id) "
+            f"AND p.event_id IN ({marks}) ORDER BY p.id"), params):
+        m = r._mapping
+        out[int(m["event_id"])].append({"id": None, "owner": m["owner"], "number": m["achievement_number"],
+                                        "kind": "участие", "date": None})
+    return out
+
+
+def find_similar_events(title: str, event_type: str, event_date: str | date,
+                        days: int = DUP_DAYS_FORM, exclude_event_id: Optional[int] = None,
+                        db_path: DbTarget = None) -> list[dict]:
+    """Подсказка при внесении: уже внесённые мероприятия, похожие на вводимое (не точное совпадение -
+    его и так подхватывает get_or_create_event_ex). Без имён внёсших: результат показывают участникам.
+    Возвращает [{event_id, title, type, event_date, records, reason}], лучшие первыми."""
+    if event_type in DUP_SKIP_TYPES or not title_key(title):
+        return []
+    try:
+        d = _to_date(event_date)
+    except ValueError:
+        return []
+    lo, hi = (d - timedelta(days=days)).isoformat(), (d + timedelta(days=days)).isoformat()
+    tn = normalize_title(title)
+    with get_engine(db_path).connect() as conn:
+        rows = _rows(conn.execute(text(
+            "SELECT e.id, e.title, e.title_norm, e.type, e.event_date, "
+            "(SELECT COUNT(*) FROM achievements a WHERE a.event_id = e.id) AS n_ach, "
+            "(SELECT COUNT(*) FROM participations p WHERE p.event_id = e.id) AS n_part "
+            "FROM events e WHERE e.type = :t AND e.event_date >= :lo AND e.event_date <= :hi"),
+            {"t": event_type, "lo": lo, "hi": hi}))
+    me = {"title": title, "type": event_type, "event_date": d.isoformat()}
+    out = []
+    for r in rows:
+        if exclude_event_id is not None and int(r["id"]) == int(exclude_event_id):
+            continue
+        if r["title_norm"] == tn and str(r["event_date"])[:10] == d.isoformat():
+            continue
+        sim = similar_events(me, r, days)
+        if sim:
+            out.append({"event_id": int(r["id"]), "title": r["title"], "type": r["type"],
+                        "event_date": str(r["event_date"])[:10], "records": max(int(r["n_ach"]), int(r["n_part"])),
+                        "reason": sim["reason"], "score": sim["score"]})
+    out.sort(key=lambda x: (-x["score"], x["event_date"]))
+    return out
+
+
+def _pair(a: int, b: int) -> tuple[int, int]:
+    return (int(a), int(b)) if int(a) < int(b) else (int(b), int(a))
+
+
+def _not_dup_pairs(conn) -> set[tuple[int, int]]:  # noqa: ANN001
+    return {(int(r[0]), int(r[1])) for r in conn.execute(text("SELECT event_a, event_b FROM event_not_dup"))}
+
+
+def list_duplicate_groups(days: int = DUP_DAYS_ADMIN, db_path: DbTarget = None,
+                          include_hidden: bool = False) -> list[dict]:
+    """Группы возможных дублей мероприятий для админа. Пары, помеченные «не дубль», в группы не
+    попадают (include_hidden=True - показать всё). Группа - связная компонента попарно
+    похожих мероприятий: {'events': [{id, title, type, event_date, created_at, records:[...]}],
+    'pairs': [(a, b, reason)], 'reasons': [...], 'key': 'id-id-...'}."""
+    days = min(max(int(days), 0), DUP_MAX_DAYS)
+    with get_engine(db_path).connect() as conn:
+        evs = _rows(conn.execute(text(
+            "SELECT id, title, type, event_date, created_at FROM events ORDER BY event_date, id")))
+        hidden = set() if include_hidden else _not_dup_pairs(conn)
+        evs = [e for e in evs if e["type"] not in DUP_SKIP_TYPES and title_key(e["title"])]
+        by_bucket: dict[tuple, list[dict]] = {}
+        for e in evs:
+            e["event_date"] = str(e["event_date"])[:10]
+            by_bucket.setdefault((e["type"], e["event_date"][:4]), []).append(e)
+        parent: dict[int, int] = {}
+
+        def find(x: int) -> int:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        pairs: list[tuple[int, int, str]] = []
+        for bucket in by_bucket.values():
+            for i, a in enumerate(bucket):
+                for b in bucket[i + 1:]:
+                    if _pair(a["id"], b["id"]) in hidden:
+                        continue
+                    sim = similar_events(a, b, days)
+                    if sim:
+                        pairs.append((int(a["id"]), int(b["id"]), sim["reason"]))
+                        parent[find(int(a["id"]))] = find(int(b["id"]))
+        if not pairs:
+            return []
+        comps: dict[int, list[int]] = {}
+        for x in list(parent):
+            comps.setdefault(find(x), []).append(x)
+        by_id = {int(e["id"]): e for e in evs}
+        recs = _event_records(conn, sorted(i for ids in comps.values() for i in ids))
+    groups = []
+    for ids in comps.values():
+        if len(ids) < 2:
+            continue
+        ids = sorted(ids, key=lambda i: (by_id[i]["event_date"], i))
+        events = [{**by_id[i], "id": int(i), "records": recs.get(i, [])} for i in ids]
+        gp = [p for p in pairs if p[0] in ids]
+        groups.append({"key": "-".join(str(i) for i in ids), "events": events, "pairs": gp,
+                       "reasons": sorted({p[2] for p in gp})})
+    groups.sort(key=lambda g: (g["events"][0]["event_date"], g["key"]), reverse=True)
+    return groups
+
+
+def mark_not_duplicate(event_ids: list[int], created_by: Optional[int] = None,
+                       db_path: DbTarget = None) -> int:
+    """«Не дубль»: все пары из event_ids больше не предлагаются к объединению. Идемпотентно.
+    Возвращает число новых скрытых пар."""
+    ids = sorted({int(i) for i in event_ids})
+    added = 0
+    with get_engine(db_path).begin() as conn:
+        have = _not_dup_pairs(conn)
+        alive = {int(r[0]) for r in conn.execute(text("SELECT id FROM events"))}
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                if a in alive and b in alive and (a, b) not in have:
+                    conn.execute(text(
+                        "INSERT INTO event_not_dup (event_a, event_b, created_at, created_by) "
+                        "VALUES (:a, :b, :now, :by)"), {"a": a, "b": b, "now": _now(), "by": created_by})
+                    added += 1
+    return added
+
+
+def list_not_duplicates(db_path: DbTarget = None) -> list[dict]:
+    """Скрытые пары «не дубль» с названиями: [{id, a:{...}, b:{...}, created_at}]."""
+    with get_engine(db_path).connect() as conn:
+        rows = _rows(conn.execute(text(
+            "SELECT n.id, n.created_at, ea.id AS a_id, ea.title AS a_title, ea.event_date AS a_date, "
+            "eb.id AS b_id, eb.title AS b_title, eb.event_date AS b_date "
+            "FROM event_not_dup n JOIN events ea ON ea.id = n.event_a JOIN events eb ON eb.id = n.event_b "
+            "ORDER BY n.id DESC")))
+    return rows
+
+
+def unmark_not_duplicate(pair_id: int, db_path: DbTarget = None) -> bool:
+    with get_engine(db_path).begin() as conn:
+        return conn.execute(text("DELETE FROM event_not_dup WHERE id = :id"), {"id": int(pair_id)}).rowcount > 0
+
+
+def merge_events(event_ids: list[int], title: str, event_date: str | date,
+                 db_path: DbTarget = None) -> dict:
+    """Объединить мероприятия event_ids в одно с названием title и датой event_date.
+
+    Одна транзакция: либо всё, либо ничего. Записи участников (достижения с номерами и долями,
+    соавторы, участия, заседания) не удаляются, а переезжают на итоговое мероприятие; у достижений
+    название и дата становятся каноническими (дата окончания сдвигается на столько же), поэтому
+    при следующем редактировании записи мероприятие снова находится то же самое. Если у участника
+    уже было участие в итоговом мероприятии, дублирующее старое «участие» схлопывается (номер
+    переносится, если у оставшегося его нет) - сами достижения при этом остаются.
+    Итоговым становится уже существующее мероприятие с таким названием и датой, а если такого нет -
+    самое «богатое» из выбранных (его переименовывают). Возвращает
+    {'event_id', 'removed': [ids], 'achievements', 'participations_merged', 'before', 'after'}."""
+    ids = sorted({int(i) for i in event_ids})
+    if len(ids) < 2:
+        raise ValueError("Выберите минимум два мероприятия для объединения")
+    title = " ".join((title or "").split())
+    tn = normalize_title(title)
+    if not tn:
+        raise ValueError("Название мероприятия пустое")
+    try:
+        d = _to_date(event_date).isoformat()
+    except ValueError:
+        raise ValueError("Дата мероприятия указана неверно") from None
+    names = [f"e{i}" for i in range(len(ids))]
+    params = dict(zip(names, ids))
+    marks = ", ".join(":" + n for n in names)
+
+    def snapshot(conn, evt_ids: list[int]) -> dict:  # noqa: ANN001
+        nm = [f"s{i}" for i in range(len(evt_ids))]
+        pr = dict(zip(nm, evt_ids))
+        mk = ", ".join(":" + n for n in nm)
+        a = conn.execute(text(
+            f"SELECT COUNT(*), COUNT(NULLIF(number, '')), COALESCE(SUM(owner_share), 0) "
+            f"FROM achievements WHERE event_id IN ({mk})"), pr).first()
+        ppl = conn.execute(text(
+            f"SELECT COUNT(*), COALESCE(SUM(share), 0) FROM achievement_people WHERE achievement_id IN "
+            f"(SELECT id FROM achievements WHERE event_id IN ({mk}))"), pr).first()
+        parts = conn.execute(text(f"SELECT COUNT(*) FROM participations WHERE event_id IN ({mk})"), pr).scalar_one()
+        return {"achievements": int(a[0]), "numbers": int(a[1]), "shares": round(float(a[2] or 0), 6),
+                "people": int(ppl[0]), "people_shares": round(float(ppl[1] or 0), 6), "participations": int(parts)}
+
+    with get_engine(db_path).begin() as conn:
+        found = _rows(conn.execute(text(
+            f"SELECT id, title, type, event_date, article_topic, indexing FROM events WHERE id IN ({marks})"),
+            params))
+        if len(found) != len(ids):
+            raise ValueError("Некоторые из мероприятий уже изменены или удалены - обновите страницу.")
+        types = {r["type"] for r in found}
+        if len(types) != 1:
+            raise ValueError("Нельзя объединять мероприятия разных типов")
+        etype = types.pop()
+        target = conn.execute(
+            text("SELECT id FROM events WHERE title_norm = :tn AND type = :t AND event_date = :d"),
+            {"tn": tn, "t": etype, "d": d}).scalar()
+        involved = list(ids)
+        if target is None:  # итоговое - самое «богатое» из выбранных, оно переименовывается
+            weight = {i: snapshot(conn, [i]) for i in ids}
+            target = max(ids, key=lambda i: (weight[i]["achievements"] + weight[i]["participations"], -i))
+        else:
+            target = int(target)
+            if target not in involved:
+                involved.append(target)
+        before = snapshot(conn, involved)
+        conn.execute(text("UPDATE events SET title = :title, title_norm = :tn, event_date = :d WHERE id = :id"),
+                     {"title": title, "tn": tn, "d": d, "id": target})
+        sources = [i for i in involved if i != target]
+        moved_part = 0
+        for src in sources:
+            p = {"src": src, "dst": target}
+            conn.execute(text(
+                "UPDATE participations SET achievement_number = ("
+                "  SELECT o.achievement_number FROM participations o"
+                "  WHERE o.event_id = :src AND o.user_id = participations.user_id) "
+                "WHERE event_id = :dst AND (achievement_number IS NULL OR achievement_number = '') "
+                "AND user_id IN (SELECT user_id FROM participations WHERE event_id = :src)"), p)
+            moved_part += conn.execute(text(
+                "DELETE FROM participations WHERE event_id = :src "
+                "AND user_id IN (SELECT user_id FROM participations WHERE event_id = :dst)"), p).rowcount
+            conn.execute(text("UPDATE participations SET event_id = :dst WHERE event_id = :src"), p)
+            conn.execute(text("UPDATE achievements SET event_id = :dst WHERE event_id = :src"), p)
+            conn.execute(text("UPDATE meetings SET event_id = :dst WHERE event_id = :src"), p)
+            conn.execute(text(
+                "UPDATE events SET article_topic = COALESCE(article_topic, "
+                "(SELECT article_topic FROM events WHERE id = :src)), indexing = COALESCE(indexing, "
+                "(SELECT indexing FROM events WHERE id = :src)) WHERE id = :dst"), p)
+            conn.execute(text("DELETE FROM event_not_dup WHERE event_a = :src OR event_b = :src"), p)
+            conn.execute(text("DELETE FROM events WHERE id = :src"), p)
+        # достижения: каноническое название и дата (дата окончания сдвигается вместе с началом)
+        for a in _rows(conn.execute(text(
+                "SELECT id, title, date_from, date_to FROM achievements WHERE event_id = :t"), {"t": target})):
+            new_to = a["date_to"]
+            old_from = str(a["date_from"] or "")[:10]
+            if old_from and old_from != d and a["date_to"]:
+                shift = _to_date(d) - _to_date(old_from)
+                new_to = (_to_date(a["date_to"]) + shift).isoformat()
+            if a["title"] != title or old_from != d or new_to != a["date_to"]:
+                conn.execute(text("UPDATE achievements SET title = :title, date_from = :d, date_to = :to, "
+                                  "updated_at = :now WHERE id = :id"),
+                             {"title": title, "d": d, "to": new_to, "now": _now(), "id": a["id"]})
+        after = snapshot(conn, [target])
+        lost = {k: (before[k], after[k]) for k in ("achievements", "numbers", "shares", "people", "people_shares")
+                if before[k] != after[k]}
+        if lost or before["participations"] - after["participations"] != moved_part:
+            raise RuntimeError(f"Объединение отменено: данные не сошлись {lost}")
+        return {"event_id": target, "removed": sources, "achievements": after["achievements"],
+                "participations_merged": moved_part, "before": before, "after": after}
 
 
 @cached
