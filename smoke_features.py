@@ -251,7 +251,7 @@ def run_report_gate(target) -> None:  # noqa: ANN001
         ("grant.pp", "grant", dict(subpoint_id=SP("grant.pp"), title="ПП 1", date_from=Y, topic="Т"), 1),
         ("grant.funds", "grant", dict(subpoint_id=SP("grant.funds"), title="Фонд 1", date_from=Y, topic="Т"), 1),
         ("grant.hoz", "grant", dict(subpoint_id=SP("grant.hoz"), title="Хоз 1", date_from=Y, topic="Т"), 1),
-        ("stipend", "stipend", dict(row_id=R("I08.other"), title="Стипендия", ayear="2025-2026"), 1),
+        ("stipend", "stipend", dict(row_id=R("I08.other"), title="Стипендия", ayear="2026-2027"), 0),
         ("exchange", "exchange", dict(row_id=R("I10.intl"), title="Обмен", date_from=Y), 1),
         ("fsi", "fsi", dict(row_id=R("I13.umnik_p"), title="УМНИК", date_from=Y), 1),
         ("prize", "prize", dict(row_id=R("I14.ru"), title="Премия", date_from=Y), 1),
@@ -284,7 +284,7 @@ def run_report_gate(target) -> None:  # noqa: ANN001
             assert aid in tdp and "no_number" in tdp[aid]["problem_codes"], label
         else:
             assert aid not in warn and aid not in tdp, label
-    assert rd["total"] == sum(1 for *_x, need in cases if not need)  # в отчёте только 3 вида без номера
+    assert rd["total"] == sum(1 for *_x, need in cases if not need)  # в отчёте только виды без номера (стипендия, СНО-виды)
     # с номером запись попадает в отчёт, предупреждение исчезает
     for i, (label, (aid, data, need)) in enumerate(ids.items()):
         if need:
@@ -418,8 +418,48 @@ def run_report_gate(target) -> None:  # noqa: ANN001
     assert "не поддержана" in ach.GRANT_STATUSES and "поддержана" in ach.GRANT_STATUSES
     # «Мои достижения»: save_achievement сообщает, считается ли запись
     assert ach.save_achievement({**ids["edu"][1], "title": "Без номера 2"}, admin, db_path=target)["counted"] is False
+    # стипендия: номер не нужен (в отчёт без номера, не в «Что дозаполнить»), год - только первый год
+    # учебного года (когда получили): 2026-2027 -> только 2026, 2025-2026 -> только 2025
+    st_k = K["stipend"]["id"]
+
+    def _ids_in(year: int) -> set[int]:
+        rd_ = ach.report_data(year, db_path=target)
+        return {x["id"] for i in rd_["indicators"] for x in [*i["records"], *[y for row in i["rows"] for y in row["records"]]]}
+
+    s26 = ach.save_achievement({"kind_id": st_k, "owner_id": u, "row_id": R("I08.other"),
+                                "title": "Стипендия без номера 26", "ayear": "2026-2027"}, admin, db_path=target)
+    s25 = ach.save_achievement({"kind_id": st_k, "owner_id": u, "row_id": R("I08.other"),
+                                "title": "Стипендия без номера 25", "ayear": "2025-2026"}, admin, db_path=target)
+    assert s26["counted"] and not s26["issues"] and s25["counted"] and not s25["issues"], (s26, s25)
+    assert not ach.kind_needs_number("stipend", u) and ach.kind_needs_number("doklad", u)
+    db.clear_cache()
+    for year, inside, outside in ((2025, s25, s26), (2026, s26, s25), (2027, None, s26), (2024, None, s25)):
+        got = _ids_in(year)
+        listed = {r["id"] for r in ach.list_achievements(year=year, db_path=target)}
+        mine = {r["id"] for r in ach.list_achievements(owner_id=u, year=year, with_coauthored=True, db_path=target)}
+        if inside:
+            assert inside["id"] in got and inside["id"] in listed and inside["id"] in mine, year
+        assert outside["id"] not in got and outside["id"] not in listed and outside["id"] not in mine, year
+        assert not any(x["id"] in (s25["id"], s26["id"]) for x in todo.list_todo(year=year, db_path=target)), year
+        assert not any(w["id"] in (s25["id"], s26["id"]) for w in ach.report_data(year, db_path=target)["warnings"])
+    assert not any(x["id"] in (s25["id"], s26["id"]) for x in todo.list_todo(db_path=target))
+    assert not any(r["id"] in (s25["id"], s26["id"])
+                   for r in ach.list_achievements(needs_fill=True, db_path=target))
+    line = ach.record_line(ach.get_achievement(s26["id"], target))
+    assert line.startswith("Стипендия без номера 26 2026-2027 гг."), line
+    # пустой учебный год по-прежнему блокирует отчёт (номер при этом не спрашиваем)
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET details = '{}' WHERE id = :i"), {"i": s26["id"]})
+    db.clear_cache()
+    r = ach.get_achievement(s26["id"], target)
+    assert not r["counted"] and any("учебный год" in i for i in r["issues"]), r["issues"]
+    assert not any("номер" in i for i in r["issues"]), r["issues"]
+    assert s26["id"] in {x["id"] for x in todo.list_todo(year=2026, db_path=target)}
+    for aid in (s25["id"], s26["id"]):
+        ach.delete_achievement(aid, db_path=target)
+    db.clear_cache()
     print(f"  report gate OK ({len(cases)} видов/подпунктов: без номера не считается и даёт предупреждение; "
-          "исключения agreement/sno_contest/funded/без владельца; пустые поля, чужой уровень, без даты, "
+          "исключения stipend/agreement/sno_contest/funded/без владельца; пустые поля, чужой уровень, без даты, "
           "заглушки номера, дубль номера)")
 
 

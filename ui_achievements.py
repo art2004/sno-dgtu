@@ -247,6 +247,8 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
         if key == "number" and ach.kind_needs_number(kind["code"], True):
             lab = label + " *"
             hlp = "Без номера запись сохраняется, но в годовой отчёт не попадает."
+        elif key == "number" and kind["code"] == "stipend":
+            hlp = "Для стипендии номер необязателен: запись попадает в отчёт и без него."
         if ftype == "text":
             ss.setdefault(f(key), "")
             st.text_input(lab, key=f(key), help=hlp,

@@ -304,9 +304,11 @@ NUMBER_MAX_LEN = 64
 #  * agreement (Соглашение с партнёром) - в форме вообще нет поля «номер»;
 #  * sno_contest (Конкурс оценки СНО), funded (Финансируемая работа) - записи самого СНО, не личные
 #    достижения участника (админский учёт; решение пользователя: номер не нужен);
+#  * stipend (Стипендия) - номер достижения / проверка не нужны (решение пользователя); в отчёт идёт
+#    без номера, но учебный год по-прежнему обязателен;
 #  * любой записи без владельца (админская запись «СНО в целом» - личного портфолио нет).
 # Организация мероприятий (org_sci, org_pop): у записи с участником-организатором номер нужен.
-NUMBER_EXEMPT_KINDS = frozenset({"agreement", "sno_contest", "funded"})
+NUMBER_EXEMPT_KINDS = frozenset({"agreement", "sno_contest", "funded", "stipend"})
 PLACEHOLDER_PREFIX = "мероприятие не указано"  # так импорт из ЛК помечает доклады без мероприятия
 PLACEHOLDER_MSG = "в названии заглушка «Мероприятие не указано» - впишите мероприятие"
 # «номера», которыми заполняют поле, чтобы отвязаться: считаются пустым номером
@@ -1328,12 +1330,22 @@ def get_achievement(achievement_id: Optional[int], db_path: DbTarget = None) -> 
         return _decorate(conn, [rec])[0] if rec else None
 
 
+# kind_id стипендий (подзапрос - не зависит от того, присоединена ли таблица kinds в запросе)
+_STIPEND_KINDS_SQL = "(SELECT id FROM kinds WHERE form = 'stipend')"
+
+
 def year_cond(year: Optional[int], alias: str = "a") -> tuple[str, dict]:
-    """A record belongs to a year when its period intersects it (stipend 2024-2025 and
-    2025-2026 both count for 2025, as in the example report)."""
+    """A record belongs to a year when its period (date_from..date_to) intersects it.
+    Exception - stipends: only the year the stipend starts (= year it was won/awarded), i.e.
+    the start year of the academic year: stipend 2026-2027 counts for 2026 only, 2025-2026 for
+    2025 only. Stored stipends keep date_from = 01.09 of the start year and date_to = 31.08 of
+    the next one, so the rule is applied here (by date_from) rather than by migrating data."""
     if not year:
         return "", {}
-    return (f" AND {alias}.date_from <= :y_to AND COALESCE({alias}.date_to, {alias}.date_from) >= :y_from",
+    a = alias
+    return (f" AND (({a}.kind_id IN {_STIPEND_KINDS_SQL} AND {a}.date_from >= :y_from AND {a}.date_from <= :y_to)"
+            f" OR ({a}.kind_id NOT IN {_STIPEND_KINDS_SQL}"
+            f" AND {a}.date_from <= :y_to AND COALESCE({a}.date_to, {a}.date_from) >= :y_from))",
             {"y_from": f"{int(year):04d}-01-01", "y_to": f"{int(year):04d}-12-31"})
 
 
@@ -1676,9 +1688,11 @@ def unmark_event_not_dup(pair_id: int, acting_user: dict, db_path: DbTarget = No
 def available_years(db_path: DbTarget = None) -> list[int]:
     years: set[int] = set()
     with _eng(db_path).connect() as conn:
-        for a, b in conn.execute(text("SELECT date_from, date_to FROM achievements WHERE date_from IS NOT NULL")):
+        for a, b, stip in conn.execute(text(
+                f"SELECT date_from, date_to, CASE WHEN kind_id IN {_STIPEND_KINDS_SQL} THEN 1 ELSE 0 END "
+                "FROM achievements WHERE date_from IS NOT NULL")):
             y1 = int(str(a)[:4])
-            y2 = int(str(b)[:4]) if b else y1
+            y2 = int(str(b)[:4]) if b and not stip else y1  # стипендия - только год начала
             years.update(range(y1, min(y2, y1 + 3) + 1))
     return sorted(years, reverse=True)
 

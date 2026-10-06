@@ -105,14 +105,15 @@ def run_fixtures_report(target) -> None:  # noqa: ANN001
               for ind in data["indicators"] for i, r in enumerate(ind["rows"])}
     exp = {("I01", 0): 5, ("I01", 1): 0, ("I01", 2): 1, ("I02", 0): 1, ("I02", 2): 1, ("I02", 3): 1,
            ("I02", 4): 1, ("I03", 1): 3, ("I03", 3): 2, ("I04", 0): 1, ("I04", 1): 2, ("I07", 1): 1,
-           ("I08", 0): 1, ("I08", 1): 3, ("I08", 2): 1, ("I08", 4): 1, ("I09", 0): 2, ("I09", 1): 1,
+           ("I08", 1): 3, ("I08", 2): 1, ("I09", 0): 2, ("I09", 1): 1,
            ("I09", 3): 1, ("I10", 0): 2, ("I11", 0): 2, ("I12", 2): 1, ("I15", 1): 2, ("I16", 0): 1}
+    # стипендии 2024-2025 (Президента, «Умная») - только в отчёте 2024, 2025-2026 - только в 2025
     for k, v in counts.items():
         assert v == exp.get(k, 0), (k, v, exp.get(k, 0))
     totals = {i["code"]: i["count"] for i in data["indicators"]}
     assert totals["I01"] == 6 and totals["I02"] == 4 and totals["I17"] == 1 and totals["I18"] == 1
     assert totals["I05"] == 0 and totals["I13"] == 0
-    assert data["total"] == 39 and data["zaochno"] == 1 and data["warnings"] == []
+    assert data["total"] == 37 and data["zaochno"] == 1 and data["warnings"] == []
     # several dokladov by one person at one event: one event line, two numbered lines
     items = next(i for i in data["indicators"] if i["code"] == "I01")["rows"][0]["items"]
     ev = [x for x in items if x[0] == "event"]
@@ -150,13 +151,21 @@ def run_fixtures_report(target) -> None:  # noqa: ANN001
     rec = ach.get_achievement(nid, db_path=target)
     assert rec["details"].get("no_index") and rec["row_id"] is None and not rec["counted"] and rec["issues"] == []
     data2 = ach.report_data(2025, db_path=target)
-    assert data2["total"] == 39 and data2["warnings"] == []
+    assert data2["total"] == 37 and data2["warnings"] == []
     ach.delete_achievement(nid, db_path=target)
     assert per["starostin"]["by_kind"]["Публикация"] == 1  # own Scopus article only
-    # year filter: stipend 2024-2025 in 2024 and 2025; 2025-2026 in 2025 and 2026
-    s24 = [r for r in ach.list_achievements(year=2024, db_path=target) if r["form"] == "stipend"]
-    s26 = [r for r in ach.list_achievements(year=2026, db_path=target) if r["form"] == "stipend"]
-    assert len(s24) == 2 and len(s26) == 4
+    # year filter: стипендия считается только в первом году учебного года (когда её получили):
+    # 2024-2025 -> только 2024, 2025-2026 -> только 2025, в 2026 стипендий нет
+    stip = {y: sorted(r["details"]["ayear"] for r in ach.list_achievements(year=y, db_path=target)
+                      if r["form"] == "stipend") for y in (2023, 2024, 2025, 2026)}
+    assert stip == {2023: [], 2024: ["2024-2025"] * 2, 2025: ["2025-2026"] * 4, 2026: []}, stip
+    rd24 = ach.report_data(2024, db_path=target)
+    i08 = {r["label"]: r["count"] for i in rd24["indicators"] if i["code"] == "I08" for r in i["rows"]}
+    assert sum(i08.values()) == 2, i08
+    assert sum(1 for r in rd24["records"] if r["form"] == "stipend") == 2
+    for y, n in ((2024, 2), (2025, 4), (2026, 0)):  # статистика по участникам - тот же год
+        assert sum(r["by_kind"].get("Стипендия", 0) for r in ach.stats_by_person(y, db_path=target)) == n, y
+    assert {2024, 2025}.issubset(ach.available_years(target))
     # duplicate publication (title+year / DOI) → refused with the owner's name
     K = ach.kind_by_code("publication", target)
     member = db.get_user_by_id(uid["katanaeva"], db_path=target)
