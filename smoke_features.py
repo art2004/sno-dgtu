@@ -723,10 +723,105 @@ def run_ui(target) -> None:  # noqa: ANN001
     print("  UI OK (вкладки «Что дозаполнить» и «Журнал», бэкап, права, запись входа в журнал)")
 
 
+def run_member_banner(target) -> None:  # noqa: ANN001
+    """Баннер «Требуют заполнения: N» в «Мои достижения»: N = ровно записи участника, которые годовой
+    отчёт не возьмёт (те же правила, что «Что дозаполнить»), сводка по причинам, «⚠ проверьте» отдельно."""
+    from streamlit.testing.v1 import AppTest
+
+    import ui_achievements as ua
+
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    m = db.create_user("bn_m", "pass12345", "Баннеров Борис", db_path=target)
+    db.add_participation_ex(m, "Статья без долей", "статья", "2026-04-02", article_topic="т", indexing="ВАК",
+                            db_path=target)
+    db.add_participation_ex(m, "Статья без индексации", "статья", "2026-04-03", article_topic="т",
+                            indexing="Без индексации", db_path=target)
+    db.init_db(db_path=target)  # перенос в achievements: публикация без долей/журнала, «Без индексации»
+    K = lambda c: ach.kind_by_code(c, target)["id"]  # noqa: E731
+    R = lambda c: ach.row_by_code(c, target)["id"]  # noqa: E731
+    save = lambda d: ach.save_achievement({"owner_id": m, **d}, admin, db_path=target)["id"]  # noqa: E731
+    nolevel = _doklad(target, m, "Без уровня")  # уровень снимаем напрямую, как у импорта из ЛК
+    with db.get_engine(target).begin() as conn:
+        conn.execute(text("UPDATE achievements SET row_id = NULL WHERE id = :i"), {"i": nolevel})
+    ph = _doklad(target, m, "Мероприятие не указано (импорт из ЛК, уточнить)", topic="Тема из ЛК")
+    nonum = save({"kind_id": K("doklad"), "row_id": R("I01.ru"), "title": "Без номера", "date_from": "2026-03-11",
+                  "topic": "Т", "ochno": True})
+    junk = save({"kind_id": K("doklad"), "row_id": R("I01.ru"), "title": "Номер без цифр", "date_from": "2026-03-12",
+                 "topic": "Т", "ochno": True, "number": "ждём"})
+    full = _doklad(target, m, "Полный доклад")
+    zao = save({"kind_id": K("doklad"), "row_id": R("I01.ru"), "title": "Заочный", "date_from": "2026-03-13",
+                "topic": "Т", "ochno": False, "number": "Р-Н-8801-26"})
+    d1 = save({"kind_id": K("doklad"), "row_id": R("I01.ru"), "title": "Повтор номера 1", "date_from": "2026-03-14",
+               "topic": "Т", "ochno": True, "number": "Р-Н-8802-26"})
+    d2 = save({"kind_id": K("doklad"), "row_id": R("I01.reg"), "title": "Повтор номера 2", "date_from": "2026-03-15",
+               "topic": "Т", "ochno": True, "number": "Р-Н-8802-26"})
+    stip = save({"kind_id": K("stipend"), "row_id": R("I08.other"), "title": "Стипендия", "ayear": "2026-2027"})
+    db.clear_cache()
+    recs = ach.list_achievements(owner_id=m, with_coauthored=True, db_path=target)
+    by_title = {r["title"]: r for r in recs}
+    pub = by_title["Статья без долей"]["id"]
+    noidx = by_title["Статья без индексации"]["id"]
+    mt = todo.member_todo(recs)
+    assert set(mt["out"]) == {nolevel, ph, nonum, junk, pub}, (mt["out"], {r["id"]: r["issues"] for r in recs})
+    # N = ровно то, что отчёт не возьмёт (кроме заочных и «Без индексации» - они вне отчёта по замыслу)
+    excl = {r["id"] for r in recs if not todo.in_report(r)} - {zao, noidx}
+    assert excl == set(mt["out"]), excl
+    assert full not in mt["items"] and stip not in mt["items"] and zao not in mt["items"] and noidx not in mt["items"]
+    assert set(mt["check"]) == {d1, d2} and all(mt["items"][i]["in_report"] for i in (d1, d2))
+    # старый баннер (r["issues"]) считал и записи в отчёте с повтором номера
+    assert len([r for r in recs if r["issues"] and r["role"] == "owner"]) > len(mt["out"])
+    bt = mt["by_type"]  # без номера: доклад, «б/н» и перенесённая статья
+    assert bt["no_number"] == 3 and bt["placeholder"] == 1 and bt["no_level"] >= 1 and bt["no_share"] == 1, bt
+    assert "dup_number" not in bt and list(bt.values()) == sorted(bt.values(), reverse=True)
+    # совпадает с «Что дозаполнить» по этому участнику
+    assert {r["id"] for r in todo.list_todo(owner_id=m, db_path=target) if not todo.in_report(r)} == set(mt["out"])
+    text_ = ua.member_todo_banner(mt)
+    assert "Требуют заполнения: 5" in text_ and "не попадут" in text_ and "«⚠ заполните: …»" in text_, text_
+    assert "✏️" in text_ and "Сохранить изменения" in text_ and "заново не нужно" in text_
+    assert "нет номера достижения — 3" in text_ and "заглушка «Мероприятие не указано» — 1" in text_, text_
+    assert "Проверьте: 2 записи" in text_ and "Без уровня/подпункта" not in text_
+    one = ua.member_todo_banner({"out": [1], "check": [], "by_type": {"no_level": 1}, "items": {}})
+    assert "эта запись не попадёт" in one and "Проверьте" not in one
+
+    # в интерфейсе: баннер, плашки «⚠ заполните» / «⚠ проверьте», галочка «только требующие заполнения»
+    old_url, old_pw = os.environ.get("DATABASE_URL"), os.environ.get("ADMIN_PASSWORD")
+    os.environ["DATABASE_URL"] = str(db.resolve_url(target))
+    os.environ.pop("ADMIN_PASSWORD", None)
+    cwd = os.getcwd()
+    os.chdir(str(ROOT))
+    try:
+        at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
+        at.session_state["user"] = {"id": m, "login": "bn_m", "full_name": "Баннеров Борис", "role": "member"}
+        at.run()
+        assert not at.exception, at.exception
+        ws = [w.value for w in at.warning if "Требуют заполнения" in w.value]
+        assert len(ws) == 1 and "Требуют заполнения: 5" in ws[0] and "нет уровня / подпункта" in ws[0], ws
+        mds = " ".join(md.value or "" for md in at.markdown)
+        assert mds.count("⚠ заполните: ") == 5 and mds.count("⚠ проверьте: ") == 2, mds
+        assert "укажите номер достижения" in mds and "не похож на номер" in mds
+        at.checkbox(key="mine_only_todo").check().run()
+        assert not at.exception, at.exception
+        assert any(c.value == f"Найдено 5 из {len(recs)}" for c in at.caption), [c.value for c in at.caption]
+        mds = " ".join(md.value or "" for md in at.markdown)
+        assert "Полный доклад" not in mds and "Повтор номера 1" not in mds and "Без уровня" in mds
+    finally:
+        os.chdir(cwd)
+        for k, v in (("DATABASE_URL", old_url), ("ADMIN_PASSWORD", old_pw)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    db.delete_user(m, acting_user_id=admin["id"], db_path=target)
+    print(f"  member banner OK (N={len(mt['out'])} = записи вне отчёта, как в «Что дозаполнить»; "
+          f"сводка {len(bt)} причин; «⚠ проверьте» отдельно; фильтр «только требующие заполнения»)")
+
+
 def run_all(fresh) -> None:  # noqa: ANN001
     """fresh(): новая пустая база (SQLite-файл или очищенная Postgres)."""
     run_audit(fresh())
     run_todo(fresh())
+    run_member_banner(fresh())
     run_report_gate(fresh())
     run_backup(fresh(), fresh())
     run_ui(fresh())

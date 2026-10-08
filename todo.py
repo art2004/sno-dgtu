@@ -45,6 +45,33 @@ PROBLEM_LABELS = {
 }
 # Что считать проблемой по умолчанию: все, кроме заочных докладов (они не в отчёте по замыслу).
 DEFAULT_TYPES = [k for k in PROBLEM_LABELS if k != "zaochno"]
+# Проблемы, которые НЕ мешают записи попасть в отчёт (achievements._gaps: blocks=False) - только «проверьте».
+WARNING_ONLY = frozenset({"main_author", "dup_number"})
+# Короткие подписи для сводки в баннере участника («нет уровня / подпункта — 5, нет индексации — 3»).
+SHORT_LABELS = {
+    "no_level": "нет уровня / подпункта",
+    "no_indicator": "нет показателя",
+    "no_indexing": "нет индексации",
+    "no_share": "нет долей участия",
+    "no_journal": "нет журнала",
+    "main_author": "проверить главного автора",
+    "no_topic": "нет темы доклада",
+    "no_ayear": "нет учебного года",
+    "no_number": "нет номера достижения",
+    "no_owner": "не выбран участник",
+    "no_date": "нет даты",
+    "dup_number": "номер повторяется",
+    "placeholder": "заглушка «Мероприятие не указано»",
+    "duplicate": "дубль статьи",
+    "required": "пустые обязательные поля",
+    "zaochno": "заочный доклад",
+    "other": "прочее",
+}
+# Одна формулировка «почему запись не в отчёте» для подписей в интерфейсе (те же правила, что _gaps).
+REASONS_TEXT = ("нет уровня или подпункта; нет номера достижения или он без цифр (номер не нужен только "
+                "стипендиям и видам, которые вносит админ); у публикации нет индексации, долей участия или "
+                "журнала; у доклада нет темы или вместо мероприятия заглушка «Мероприятие не указано»; у "
+                "стипендии нет учебного года; пустые обязательные поля")
 
 
 def classify_issue(text_: str, form: str) -> str:
@@ -125,6 +152,40 @@ def list_todo(year: Optional[int] = None, owner_id: Optional[int] = None,
         r["problem_text"] = "; ".join(t for _, t in ps)
         out.append(r)
     return out
+
+
+def in_report(r: dict) -> bool:
+    """Попадёт ли запись в годовой отчёт своего года: считается (is_counted) и у неё есть дата."""
+    return bool(r["counted"] and r["date_from"])
+
+
+def member_todo(recs: list[dict]) -> dict:
+    """Баннер «Требуют заполнения» в «Мои достижения»: свои записи участника (соавторские - нет, их
+    правит внесший) по тем же правилам, что «Что дозаполнить» (problems() без заочных докладов).
+      'items'   - {id: {'problems': [(код, текст)], 'in_report': bool}} для каждой записи с проблемами;
+      'out'     - id записей, которые НЕ попадут в отчёт, пока их не дозаполнят;
+      'check'   - id записей в отчёте, но с замечаниями «проверьте» (WARNING_ONLY);
+      'by_type' - {код: сколько записей из 'out' с этой проблемой}, по убыванию."""
+    items: dict[int, dict] = {}
+    out: list[int] = []
+    check: list[int] = []
+    by_type: dict[str, int] = {}
+    for r in recs:
+        if r.get("role", "owner") != "owner":
+            continue
+        ps = [p for p in problems(r) if p[0] != "zaochno"]
+        if not ps:
+            continue
+        ok = in_report(r)
+        items[r["id"]] = {"problems": ps, "in_report": ok}
+        if ok:
+            check.append(r["id"])
+            continue
+        out.append(r["id"])
+        for c in {c for c, _ in ps if c not in WARNING_ONLY}:
+            by_type[c] = by_type.get(c, 0) + 1
+    by_type = dict(sorted(by_type.items(), key=lambda kv: (-kv[1], list(PROBLEM_LABELS).index(kv[0]))))
+    return {"items": items, "out": out, "check": check, "by_type": by_type}
 
 
 def counts_by_type(recs: list[dict]) -> dict[str, int]:

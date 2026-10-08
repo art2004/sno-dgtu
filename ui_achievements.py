@@ -153,8 +153,9 @@ def _save_cb(pfx: str, acting: dict, record_id: Optional[int], form: str) -> Non
         return
     msgs = [("success", "Изменения сохранены." if record_id else f"Добавлено: {kind['label'].lower()}.")]
     if res["issues"]:
-        msgs.append(("warning", ("Запись сохранена, но в годовой отчёт пока не попадает. " if not res.get("counted")
-                                 else "") + "Заполните: " + "; ".join(res["issues"])))
+        msgs.append(("warning", ("Запись сохранена, но в годовой отчёт пока не попадает. Заполните: "
+                                 if not res.get("counted") else "Запись в годовом отчёте, но проверьте: ")
+                     + "; ".join(res["issues"])))
     ss[_k(pfx, "msg")] = msgs
     if record_id:
         ss[f"edit_{record_id}"] = False
@@ -411,6 +412,8 @@ def _rec_caption(r: dict) -> str:
         parts.append(f"тема: «{r['topic']}»")
     if r["form"] == "doklad" and not r["ochno"]:
         parts.append("заочно — не в отчёте")
+    if r["form"] == "publication" and r["details"].get("no_index"):
+        parts.append("без индексации — не в отчёте")
     if r.get("role") == "coauthor":
         parts.append(f"ваша доля: {ach._share_str(r.get('my_share'))}")
     if r["form"] == "publication":
@@ -436,17 +439,23 @@ def member_list(user: dict) -> None:
     if n_co:
         st.caption(f"В том числе в соавторстве: {n_co} - статьи, где другой участник указал вас "
                    "соавтором. Их может изменить только внесший (или админ); в отчёт статья идёт один раз.")
-    todo = [r for r in recs if r["issues"] and r["role"] == "owner"]
-    if todo:
-        st.warning(f"Требуют заполнения: {len(todo)} — отмечены значком «⚠ заполните». "
-                   "Без уровня/подпункта запись не попадёт в годовой отчёт.")
+    import todo
+
+    mt = todo.member_todo(recs)
+    if mt["out"] or mt["check"]:
+        st.warning(member_todo_banner(mt))
     q = st.text_input("🔍 Поиск по моим работам", key="mine_q",
                       placeholder="номер достижения или название (можно часть слова)",
                       help="Ищет среди ваших записей по номеру достижения (из личного кабинета) и по названию "
                            "работы или мероприятия. Регистр и буква «ё» не важны; несколько слов - "
                            "запись должна содержать каждое.")
+    only_todo = False
+    if mt["out"]:
+        only_todo = st.checkbox(f"Показать только требующие заполнения ({len(mt['out'])})", key="mine_only_todo")
     shown = ach.search_records(recs, q)
-    if (q or "").strip():
+    if only_todo:
+        shown = [r for r in shown if r["id"] in set(mt["out"])]
+    if (q or "").strip() or only_todo:
         st.caption(f"Найдено {len(shown)} из {len(recs)}")
         if not shown:
             st.info("По вашему запросу ничего не найдено. Проверьте номер или название либо очистите поле поиска.")
@@ -457,18 +466,47 @@ def member_list(user: dict) -> None:
     for label, items in groups.items():
         st.markdown(f"##### {label} ({len(items)})")
         for r in items:
-            _record_row(r, user, owner_only=True, read_only=r["role"] == "coauthor")
+            _record_row(r, user, owner_only=True, read_only=r["role"] == "coauthor", todo_item=mt["items"].get(r["id"]))
 
 
-def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False) -> None:
+def member_todo_banner(mt: dict) -> str:
+    """Текст жёлтого баннера «Мои достижения» по todo.member_todo(): сколько записей не попадёт в отчёт,
+    чего в них не хватает (те же правила и коды, что во вкладке «Что дозаполнить») и как исправить."""
+    import todo
+
+    parts = []
+    n = len(mt["out"])
+    if n:
+        parts.append(
+            f"**Требуют заполнения: {n}** — "
+            + ("эта запись не попадёт в годовой отчёт, пока вы её" if n == 1 else
+               "эти записи не попадут в годовой отчёт, пока вы их")
+            + " не дозаполните. Что именно дописать, указано у каждой записи на оранжевой плашке "
+            "«⚠ заполните: …». Нажмите ✏️ у записи, допишите и нажмите «Сохранить изменения» — "
+            "вносить заново не нужно (получится дубль).")
+        parts.append("Причины: " + ", ".join(
+            f"{todo.SHORT_LABELS.get(c, c)} — {k}" for c, k in mt["by_type"].items()) + ".")
+    if mt["check"]:
+        k = len(mt["check"])
+        parts.append(f"Проверьте: {ru_text.with_count(k, RECORD_FORMS)} в отчёт {'идёт' if k == 1 else 'идут'}, "
+                     "но с замечанием «⚠ проверьте: …» (например, номер достижения повторяется в другой записи).")
+    return "  \n".join(parts)
+
+
+def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False,
+                todo_item: Optional[dict] = None) -> None:
+    """todo_item - запись из todo.member_todo()['items']: плашка «⚠ заполните» (не в отчёте) или
+    «⚠ проверьте» (в отчёте, только замечание); те же правила, что в «Что дозаполнить» и баннере."""
     rid = r["id"]
     c1, c2, c3, c4, c5 = st.columns([5, 2, 2, 1, 1], vertical_alignment="center")
     title = r["title"] or "(без названия)"
     if read_only:
         c1.markdown(f"**{title}**  \n:blue-badge[Соавтор, внёс(ла): {ach.short_name(r['owner_name']) or 'СНО'}]")
+    elif todo_item:
+        head = "⚠ проверьте: " if todo_item["in_report"] else "⚠ заполните: "
+        c1.markdown(f"**{title}**  \n:orange-badge[{head}" + ", ".join(t for _, t in todo_item["problems"]) + "]")
     else:
-        c1.markdown(f"**{title}**" + ("  \n:orange-badge[⚠ заполните: " + ", ".join(r["issues"]) + "]"
-                                       if r["issues"] else ""))
+        c1.markdown(f"**{title}**")
     cap = _rec_caption(r)
     if cap:
         c1.caption(cap)
@@ -606,9 +644,9 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
 
     st.subheader("Что дозаполнить")
     st.caption("Записи, которые не попадут в годовой отчёт или заполнены не полностью. Правила те же, что в "
-               "предупреждениях годового отчёта: нет уровня или подпункта, у публикаций нет индексации, долей "
-               "или журнала, у докладов нет темы или в названии заглушка «Мероприятие не указано», пустые "
-               "обязательные поля.")
+               "предупреждениях годового отчёта и в баннере «Требуют заполнения» у участника: "
+               + todo.REASONS_TEXT + ". Отдельно - замечания «проверьте» (повтор номера, главный автор): "
+               "с ними запись в отчёте.")
     show_msgs("td_msg")
     users = db.list_users(active_only=False)
     uopts = {0: "- все -", **{u["id"]: f"{u['full_name']} (@{u['login']})" for u in users}}
@@ -622,7 +660,7 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
                                                  types=list(todo.PROBLEM_LABELS)))
     m1, m2, m3 = st.columns(3)
     m1.metric("Записей к дозаполнению", len(recs))
-    m2.metric("Не попадут в отчёт", sum(1 for r in recs if not r["counted"]))
+    m2.metric("Не попадут в отчёт", sum(1 for r in recs if not todo.in_report(r)))
     m3.metric("Участников", len({r["owner_id"] for r in recs}))
     if by_type:
         st.caption("По типам (запись с несколькими проблемами учтена в каждой): " + "; ".join(
@@ -654,7 +692,7 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
         a.markdown(f"**{r['title'] or '(без названия)'}**  \n"
                    f"{r['owner_name'] or 'СНО'} · {r['kind_label']} · {ach.fmt_date(r['date_from'])}")
         a.markdown(":orange-badge[⚠ " + r["problem_text"] + "]")
-        b.caption("в отчёт не попадёт" if not r["counted"] else "в отчёте, но неполная")
+        b.caption("в отчёт не попадёт" if not todo.in_report(r) else "в отчёте, но неполная")
         if c.button("✏️ Открыть", key=f"td_btn_{rid}", help="Открыть запись для редактирования"):
             st.session_state["td_open"] = None if open_id == rid else rid
             st.rerun()
@@ -994,6 +1032,7 @@ def annual_report_section(year_choices: list[int]) -> None:
     import pandas as pd
 
     import annual_report
+    import todo
 
     st.subheader("Годовой отчёт о работе СНО")
     year = st.selectbox("Год", year_choices, key="annual_year")
@@ -1008,10 +1047,12 @@ def annual_report_section(year_choices: list[int]) -> None:
     c3.metric("Заочных докладов (не в отчёте)", data["zaochno"])
 
     if data["warnings"]:
-        with st.expander(f"⚠ Предупреждения ({len(data['warnings'])}) — записи без номера/уровня/подпункта/долей",
-                         expanded=True):
-            st.caption("Записи без номера достижения, уровня или подпункта не попадают в отчёт, пока их не заполнят "
-                       "(участник в «Мои достижения» или админ во вкладке «Все достижения»).")
+        with st.expander(f"⚠ Предупреждения ({len(data['warnings'])}) — записи, которые не попадут в отчёт "
+                         "или заполнены не полностью", expanded=True):
+            st.caption("Не попадают в отчёт, пока их не заполнят: " + todo.REASONS_TEXT + ". Замечания «проверьте» "
+                       "(повтор номера, главный автор) запись из отчёта не убирают - смотрите галочку «В отчёте». "
+                       "Исправить: участник - ✏️ в «Мои достижения», админ - вкладка «Что дозаполнить» "
+                       "или «Все достижения».")
             st.dataframe(pd.DataFrame([{
                 "Участник": w["owner"], "Вид": w["kind"], "Название": w["title"], "Дата": w["date"],
                 "Заполните": w["issues"], "В отчёте": bool(w["counted"])} for w in data["warnings"]]),
