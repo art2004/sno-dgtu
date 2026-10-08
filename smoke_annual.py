@@ -14,6 +14,7 @@ import annual_fixtures as fx
 import annual_report
 import auth
 import db
+import smoke_privacy
 import report
 
 NEW_TABLES = ("achievement_people", "achievements", "kind_subpoints", "kinds", "indicator_rows", "indicators")
@@ -667,6 +668,9 @@ def run_v4_bibformat(target) -> None:  # noqa: ANN001
 def run_v4_refresh(target) -> None:  # noqa: ANN001
     """Item 2: admin cache reset, TTL, data stamp for the auto-refresh."""
     from sqlalchemy import event
+    if not db.resolve_url(target).startswith("sqlite"):
+        print("  refresh: пропущено на Postgres (тест пишет «другим процессом» через sqlite3)")
+        return
     eng = db.get_engine(target)
     users = db.list_users(db_path=target)
     # a write by ANOTHER process (raw connection without our write watcher) is not seen until TTL / reset
@@ -787,12 +791,13 @@ def _impersonation_ui(target, admin, member_id) -> None:  # noqa: ANN001
 
     app_dir = str(Path(__file__).resolve().parent)
     old_url, old_pw = os.environ.get("DATABASE_URL"), os.environ.get("ADMIN_PASSWORD")
-    os.environ["DATABASE_URL"] = "sqlite:///" + str(Path(target).resolve())
+    os.environ["DATABASE_URL"] = str(db.resolve_url(target))  # SQLite-файл или тестовый Postgres
     os.environ.pop("ADMIN_PASSWORD", None)
     cwd = os.getcwd()
     os.chdir(app_dir)
     try:
         db.set_app_setting("sno_name", "Тест", db_path=target)
+        smoke_privacy.consent_all(target)  # экран согласия на ПДн проверяется в smoke_privacy
         at = AppTest.from_file(str(Path(app_dir) / "app.py"), default_timeout=90)
         at.session_state["user"] = {"id": admin["id"], "login": admin["login"], "full_name": admin["full_name"],
                                     "role": "admin"}

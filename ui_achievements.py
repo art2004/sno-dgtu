@@ -153,9 +153,11 @@ def _save_cb(pfx: str, acting: dict, record_id: Optional[int], form: str) -> Non
         return
     msgs = [("success", "Изменения сохранены." if record_id else f"Добавлено: {kind['label'].lower()}.")]
     if res["issues"]:
+        rec = ach.get_achievement(res["id"]) if any(ach.is_dup_number_issue(t) for t in res["issues"]) else None
+        issues = ach.issues_for(rec, acting) if rec else res["issues"]
         msgs.append(("warning", ("Запись сохранена, но в годовой отчёт пока не попадает. Заполните: "
                                  if not res.get("counted") else "Запись в годовом отчёте, но проверьте: ")
-                     + "; ".join(res["issues"])))
+                     + "; ".join(issues)))
     ss[_k(pfx, "msg")] = msgs
     if record_id:
         ss[f"edit_{record_id}"] = False
@@ -441,7 +443,7 @@ def member_list(user: dict) -> None:
                    "соавтором. Их может изменить только внесший (или админ); в отчёт статья идёт один раз.")
     import todo
 
-    mt = todo.member_todo(recs)
+    mt = todo.member_todo(recs, viewer=user)
     if mt["out"] or mt["check"]:
         st.warning(member_todo_banner(mt))
     q = st.text_input("🔍 Поиск по моим работам", key="mine_q",
@@ -493,6 +495,15 @@ def member_todo_banner(mt: dict) -> str:
     return "  \n".join(parts)
 
 
+def _badge_text(text_: str) -> str:
+    """Текст внутри :orange-badge[…]: квадратные скобки из названий записей ломают разметку бейджа,
+    а *, _, `, $ - включали бы курсив / код / формулы."""
+    t = (text_ or "").replace("[", "(").replace("]", ")").replace("\\", "\\\\")
+    for ch in "*_`$":
+        t = t.replace(ch, "\\" + ch)
+    return t
+
+
 def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False,
                 todo_item: Optional[dict] = None) -> None:
     """todo_item - запись из todo.member_todo()['items']: плашка «⚠ заполните» (не в отчёте) или
@@ -504,7 +515,8 @@ def _record_row(r: dict, acting: dict, owner_only: bool, read_only: bool = False
         c1.markdown(f"**{title}**  \n:blue-badge[Соавтор, внёс(ла): {ach.short_name(r['owner_name']) or 'СНО'}]")
     elif todo_item:
         head = "⚠ проверьте: " if todo_item["in_report"] else "⚠ заполните: "
-        c1.markdown(f"**{title}**  \n:orange-badge[{head}" + ", ".join(t for _, t in todo_item["problems"]) + "]")
+        c1.markdown(f"**{title}**  \n:orange-badge[{head}" + _badge_text(", ".join(t for _, t in todo_item["problems"]))
+                    + "]")
     else:
         c1.markdown(f"**{title}**")
     cap = _rec_caption(r)
@@ -596,7 +608,7 @@ def admin_achievements(acting: dict, year_choices: list[int], year_label) -> Non
             "Уровень / подпункт": ach.strip_dash(r["row_label"] or r["subpoint_label"] or ""),
             "Название": r["title"], "Дата": ach.fmt_date(r["date_from"]),
             "Номер в портфолио": r["number"] or "", "Есть номер": bool(r["number"]),
-            "В отчёте": bool(r["counted"]), "Заполните": ", ".join(r["issues"]),
+            "В отчёте": bool(r["counted"]), "Заполните": ", ".join(ach.issues_for(r, acting)),
         } for r in recs]),
         hide_index=True, width="stretch",
         column_config={
@@ -655,7 +667,7 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
     year = c2.selectbox("Период", year_choices, format_func=year_label, key="td_year")
     types = c3.multiselect("Тип проблемы", list(todo.PROBLEM_LABELS), default=todo.DEFAULT_TYPES,
                            format_func=todo.PROBLEM_LABELS.get, key="td_types")
-    recs = todo.list_todo(year=year or None, owner_id=uid or None, types=types)
+    recs = todo.list_todo(year=year or None, owner_id=uid or None, types=types, viewer=acting)
     by_type = todo.counts_by_type(todo.list_todo(year=year or None, owner_id=uid or None,
                                                  types=list(todo.PROBLEM_LABELS)))
     m1, m2, m3 = st.columns(3)
@@ -691,7 +703,7 @@ def admin_todo(acting: dict, year_choices: list[int], year_label) -> None:  # no
         a, b, c = st.columns([6, 2, 1], vertical_alignment="center")
         a.markdown(f"**{r['title'] or '(без названия)'}**  \n"
                    f"{r['owner_name'] or 'СНО'} · {r['kind_label']} · {ach.fmt_date(r['date_from'])}")
-        a.markdown(":orange-badge[⚠ " + r["problem_text"] + "]")
+        a.markdown(":orange-badge[⚠ " + _badge_text(r["problem_text"]) + "]")
         b.caption("в отчёт не попадёт" if not todo.in_report(r) else "в отчёте, но неполная")
         if c.button("✏️ Открыть", key=f"td_btn_{rid}", help="Открыть запись для редактирования"):
             st.session_state["td_open"] = None if open_id == rid else rid

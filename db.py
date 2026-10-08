@@ -301,7 +301,9 @@ _SCHEMA = [
         role TEXT NOT NULL CHECK(role IN ('admin', 'member')),
         created_at TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
-        last_login TEXT
+        last_login TEXT,
+        pd_consent_at TEXT,
+        pd_consent_version TEXT
     )
     """,
     """
@@ -405,6 +407,9 @@ def _create_schema(db_path: DbTarget = None) -> None:
 # ALTER TABLE ... ADD COLUMN only when missing → idempotent, data untouched.
 _ADDED_COLUMNS = [
     ("users", "last_login", "TEXT"),
+    # согласие на обработку ПДн (152-ФЗ): время (МСК) и версия политики; NULL = ещё не давал
+    ("users", "pd_consent_at", "TEXT"),
+    ("users", "pd_consent_version", "TEXT"),
     ("events", "article_topic", "TEXT"),
     ("events", "indexing", "TEXT"),
     ("participations", "achievement_number", "TEXT"),
@@ -476,10 +481,14 @@ def _migrate_schema(eng: Engine) -> None:
     # 2) Add missing columns.
     insp = inspect(eng)
     existing = {t: {c["name"] for c in insp.get_columns(t)} for t in {t for t, _, _ in _ADDED_COLUMNS}}
+    # Postgres: ADD COLUMN IF NOT EXISTS - два процесса, стартующие одновременно, не упадут на гонке
+    # (колонка без DEFAULT/NOT NULL добавляется мгновенно, без перезаписи таблицы). SQLite такой
+    # формы не знает - там хватает проверки по inspect (один процесс на файл).
+    if_not_exists = " IF NOT EXISTS" if eng.dialect.name == "postgresql" else ""
     with eng.begin() as conn:
         for table, col, ddl in _ADDED_COLUMNS:
             if col not in existing[table]:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN{if_not_exists} {col} {ddl}"))
 
     # 3) Annual report: indicator catalog, achievements; legacy participations are copied
     #    into achievements (idempotent, nothing deleted) — see achievements.py.
@@ -619,7 +628,8 @@ def list_users(
     role: Optional[str] = None,
     db_path: DbTarget = None,
 ) -> list[dict]:
-    sql = "SELECT id, login, full_name, role, created_at, active, last_login FROM users WHERE 1=1"
+    sql = ("SELECT id, login, full_name, role, created_at, active, last_login, pd_consent_at, pd_consent_version "
+           "FROM users WHERE 1=1")
     params: dict[str, Any] = {}
     if active_only:
         sql += " AND active = 1"
@@ -657,6 +667,24 @@ def touch_last_login(user_id: int, min_gap_seconds: int = 0, db_path: DbTarget =
         import sys
         print(f"touch_last_login failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return False
+
+
+def set_pd_consent(user_id: int, version: str, db_path: DbTarget = None) -> str:
+    """Записать согласие на обработку ПДн: время (МСК, ISO) и версию политики. Возвращает время."""
+    now = _now_msk()
+    with get_engine(db_path).begin() as conn:
+        n = conn.execute(text("UPDATE users SET pd_consent_at = :t, pd_consent_version = :v WHERE id = :id"),
+                         {"t": now, "v": str(version), "id": int(user_id)}).rowcount
+    if not n:
+        raise ValueError("Пользователь не найден.")
+    return now
+
+
+def clear_pd_consent(user_id: int, db_path: DbTarget = None) -> bool:
+    """Отзыв согласия (делает админ по обращению участника): при следующем входе спросим снова."""
+    with get_engine(db_path).begin() as conn:
+        return conn.execute(text("UPDATE users SET pd_consent_at = NULL, pd_consent_version = NULL WHERE id = :id"),
+                            {"id": int(user_id)}).rowcount > 0
 
 
 def list_user_activity(db_path: DbTarget = None) -> list[dict]:

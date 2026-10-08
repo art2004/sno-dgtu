@@ -35,6 +35,8 @@ ACTION_LABELS = {
     "achievement_update": "Достижение: изменение",
     "achievement_delete": "Достижение: удаление",
     "login": "Вход",
+    "pd_consent": "Согласие на обработку ПДн",
+    "pd_consent_reset": "Согласие на обработку ПДн: отзыв",
     "impersonate_start": "Вход от имени участника",
     "impersonate_stop": "Возврат в админа",
     "import_members": "Импорт участников (Excel)",

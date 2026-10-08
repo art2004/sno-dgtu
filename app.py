@@ -15,6 +15,7 @@ import auth
 import backup
 import brand
 import db
+import privacy
 import report
 import ru_text
 import achievements as ach
@@ -36,7 +37,7 @@ def _engine():
 
 # Bump SCHEMA_VERSION when the schema changes: Streamlit Cloud hot-reloads code on
 # push without restarting the process, so a cached init would never re-run.
-SCHEMA_VERSION = "2026-10-02-v6-event-dups-last-login"
+SCHEMA_VERSION = "2026-10-08-v7-pd-consent"
 
 
 @st.cache_resource(show_spinner="Подключение к базе данных…")
@@ -253,6 +254,45 @@ def render_login() -> None:
                               summary=f"Вход: {user['full_name']} (@{user['login']})")
                     _queue_auth_cookie(user["id"])
                     st.rerun()
+    _policy_expander()
+
+
+def _policy_expander(expanded: bool = False) -> None:
+    with st.expander(f"📄 {privacy.POLICY_TITLE}", expanded=expanded):
+        st.markdown(privacy.policy_markdown())
+
+
+@st.dialog(privacy.POLICY_TITLE, width="large")
+def _policy_dialog() -> None:
+    st.markdown(privacy.policy_markdown())
+
+
+def _consent_user() -> dict | None:
+    """Чьё согласие нужно: реального пользователя сессии (в режиме «войти как» - админа, он
+    уже давал согласие при входе; участник даст своё сам, когда войдёт)."""
+    ss = st.session_state
+    return ss.get("_imp_admin") or ss.get("user")
+
+
+def render_consent(user: dict) -> None:
+    """Экран согласия на обработку ПДн: до него никакие данные сайта не показываются."""
+    brand.login_header(brand.sno_name(db))
+    st.subheader("Согласие на обработку персональных данных")
+    st.markdown(f"Здравствуйте, **{user['full_name']}**! " + privacy.CONSENT_NOTICE)
+    _policy_expander()
+    with st.form("pd_consent_form"):
+        checked = st.checkbox(privacy.CONSENT_LABEL, key="pd_consent_check")
+        go = st.form_submit_button("Продолжить", type="primary", width="stretch")
+    if go:
+        ok, msg = privacy.give_consent(user, checked)
+        if ok:
+            st.session_state["_consent_msg"] = msg
+            st.rerun()
+        st.error(msg)
+    st.caption("Без согласия пользоваться сайтом нельзя. Если не согласны - нажмите «Выйти» и при "
+               "необходимости обратитесь к лидеру СНО.")
+    if st.button("Выйти", key="pd_consent_logout"):
+        logout()
 
 
 AUTO_REFRESH_SECONDS = 60
@@ -329,6 +369,11 @@ def render_sidebar(user: dict) -> None:
             st.caption("Пароль меняет сам участник.")
         else:
             _password_form(user)
+        if st.button(f"📄 {privacy.POLICY_TITLE}", key="sb_policy", type="tertiary"):
+            _policy_dialog()
+        me = db.get_user_by_id((st.session_state.get("_imp_admin") or user)["id"]) or {}
+        if me.get("pd_consent_at"):
+            st.caption(f"Согласие на обработку ПДн дано {privacy.fmt_consent_at(me['pd_consent_at'])}.")
         st.caption(f"База данных: {db.backend_name()}")
 
 
@@ -497,6 +542,20 @@ def admin_members(user: dict) -> None:
                     else:
                         st.session_state[f"confirm_del_u_{u['id']}"] = True
 
+            if u.get("pd_consent_at"):
+                cc1, cc2 = st.columns([4, 2], vertical_alignment="center")
+                cc1.caption(f"Согласие на обработку ПДн: дано {privacy.fmt_consent_at(u['pd_consent_at'])} "
+                            f"(политика от {privacy.fmt_version(u.get('pd_consent_version') or '')})")
+                if cc2.button("Отметить отзыв согласия", key=f"pd_reset_{u['id']}",
+                              help="Если участник отозвал согласие: при следующем входе сайт спросит его "
+                                   "снова и без согласия не пустит. Чтобы закрыть доступ совсем - снимите «Активен»."):
+                    db.clear_pd_consent(u["id"])
+                    audit.log_ui(st.session_state, "pd_consent_reset", target_user=u, entity="user",
+                                 entity_id=u["id"], summary=f"Отмечен отзыв согласия на обработку ПДн: {u['full_name']}")
+                    st.session_state[f"user_msg_{u['id']}"] = ("success", "Отзыв согласия отмечен.")
+                    st.rerun()
+            else:
+                st.caption("Согласие на обработку ПДн: ещё не дано (сайт спросит при входе).")
             if u["active"] and u["role"] == "member" and u["id"] != user["id"]:
                 st.button("Войти как этот участник", key=f"imp_go_{u['id']}",
                           on_click=_impersonate_cb, args=(u["id"],))
@@ -1138,7 +1197,12 @@ def main() -> None:
     user = st.session_state.user
     if user is None:
         render_login()
+    elif privacy.needs_consent(_consent_user()["id"]):
+        render_consent(_consent_user())
     else:
+        msg = st.session_state.pop("_consent_msg", None)
+        if msg:
+            st.toast(msg, icon="✅")
         brand.compact_header(brand.sno_name(db))
         render_sidebar(user)
         render_impersonation_banner(user)

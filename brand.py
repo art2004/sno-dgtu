@@ -94,6 +94,12 @@ _CSS = """
   border-left: 4px solid #907436;
 }
 [data-testid="stMetricLabel"] p { color: #5F6B63; }
+/* плашки :orange-badge[⚠ заполните: …] - переносить на несколько строк, а не обрезать «…»
+   (у Streamlit по умолчанию white-space: nowrap + text-overflow: ellipsis) */
+span.stMarkdownBadge {
+  white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+  overflow-wrap: anywhere; word-break: normal; line-height: 1.45; padding-top: .1rem; padding-bottom: .1rem;
+}
 /* вкладки: активная — фирменный зелёный */
 button[data-baseweb="tab"][aria-selected="true"] p { color: #1B5E34; font-weight: 600; }
 </style>

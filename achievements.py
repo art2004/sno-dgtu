@@ -1267,6 +1267,7 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
     dup_num = {n: c for n, c in conn.execute(text(
         "SELECT number, COUNT(*) FROM achievements WHERE number IS NOT NULL AND number <> '' "
         "GROUP BY number HAVING COUNT(*) > 1"))}
+    dup_recs = _number_duplicates(conn, [r["number"] for r in recs if r["number"] in dup_num]) if dup_num else {}
     for r in recs:
         r["people"] = people.get(r["id"], [])
         r["details"] = _details(r["details"])
@@ -1279,11 +1280,121 @@ def _decorate(conn, recs: list[dict]) -> list[dict]:  # noqa: ANN001
         r["indicator_has_rows"] = r["indicator_id"] in has_rows
         r["dup_of"] = dup_of.get(r["id"])
         r["dup_number"] = dup_num.get(r["number"], 1) - 1 if r["number"] else 0
+        # другие записи с тем же номером (для понятного текста замечания, см. dup_number_text)
+        r["dup_number_with"] = [o for o in dup_recs.get(r["number"], []) if o["id"] != r["id"]] \
+            if r["dup_number"] else []
         r["counted"] = is_counted(r)
         r["issues"] = record_issues(r)
         if r["details"].get("no_index") and not r["row_id"]:
             r["row_label"] = NO_INDEX_LABEL
     return recs
+
+
+def _number_duplicates(conn, numbers: list[str]) -> dict[str, list[dict]]:  # noqa: ANN001
+    """{номер: [записи с этим номером]} - id, короткое название, вид, дата, владелец и кто ещё видит
+    запись (соавторы публикации, выбранные из списка участников): для текста «номер уже указан в …»."""
+    numbers = sorted({n for n in numbers if n})
+    if not numbers:
+        return {}
+    names = [f"n{j}" for j in range(len(numbers))]
+    rows = _rows(conn.execute(text(
+        "SELECT a.id, a.number, a.title, a.topic, a.date_from, a.owner_id, k.label AS kind_label, "
+        "k.form AS kind_form, u.full_name AS owner_name FROM achievements a JOIN kinds k ON k.id = a.kind_id "
+        "LEFT JOIN users u ON u.id = a.owner_id WHERE a.number IN (" + ", ".join(":" + n for n in names)
+        + ") ORDER BY a.date_from, a.id"), dict(zip(names, numbers))))
+    seen: dict[int, list[int]] = {}
+    ids = [r["id"] for r in rows if r["kind_form"] == "publication"]
+    if ids:
+        pn = [f"p{j}" for j in range(len(ids))]
+        for aid, uid in conn.execute(text(
+                "SELECT achievement_id, user_id FROM achievement_people WHERE user_id IS NOT NULL "
+                "AND sort_order >= 0 AND name <> '' AND achievement_id IN (" + ", ".join(":" + n for n in pn) + ")"),
+                dict(zip(pn, ids))):
+            seen.setdefault(int(aid), []).append(int(uid))
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        title = (r["title"] or "").strip()
+        if title.lower().startswith(PLACEHOLDER_PREFIX) and (r["topic"] or "").strip():
+            title = r["topic"].strip()  # импорт из ЛК: вместо мероприятия заглушка, название работы - в теме
+        out.setdefault(r["number"], []).append({
+            "id": int(r["id"]), "title": title, "kind_label": r["kind_label"], "date_from": _iso(r["date_from"]),
+            "owner_id": r["owner_id"], "owner_name": r["owner_name"], "viewers": seen.get(int(r["id"]), [])})
+    return out
+
+
+DUP_NUMBER_TAIL = " - не внесено ли одно достижение дважды?"
+_IN_RECORDS = ("записи", "записях", "записях")  # «в 1 записи», «в 2 записях», «в 5 записях»
+
+
+def _can_see(other: dict, viewer: Optional[dict]) -> bool:
+    """Видит ли viewer запись other: админ - все; участник - свои и публикации, где он соавтор."""
+    if viewer is None:
+        return False
+    if viewer.get("role") == "admin":
+        return True
+    vid = viewer.get("id")
+    return vid is not None and (other.get("owner_id") == vid or vid in (other.get("viewers") or []))
+
+
+def _short_title(title: str, limit: int = 45) -> str:
+    title = " ".join((title or "").split()) or "без названия"
+    return title if len(title) <= limit else title[: limit - 1].rstrip() + "…"
+
+
+def _dup_ref(other: dict, r: dict) -> str:
+    """«Название…» (Вид, 12.03.2025[, Иванов И.И.]) - владелец, если запись не того же участника."""
+    bits = [other["kind_label"], fmt_date(other["date_from"]) or "без даты"]
+    if other.get("owner_id") != r.get("owner_id"):
+        bits.append(short_name(other.get("owner_name")) or "СНО")
+    return f"«{_short_title(other['title'])}» ({', '.join(bits)})"
+
+
+def dup_number_text(r: dict, viewer: Optional[dict] = None) -> str:
+    """Замечание о повторе номера достижения. viewer - кто смотрит ({id, role}): название, вид и дату
+    другой записи показываем, только если viewer её видит (админ - всё; участник - свои записи и
+    публикации, где он соавтор), иначе «у другого участника». viewer=None - без подробностей (так
+    текст хранится в r["issues"] и журнале, чтобы нигде не показать чужое название по ошибке)."""
+    others = r.get("dup_number_with") or []
+    n = len(others) or int(r.get("dup_number") or 0)
+    head = f"номер «{r.get('number') or ''}» уже указан"
+    where = " в другой записи" if n == 1 else f" ещё в {n} {ru_plural(n, _IN_RECORDS)}"
+    if viewer is None or not others:
+        return head + where + DUP_NUMBER_TAIL
+    visible = [o for o in others if _can_see(o, viewer)]
+    hidden = len(others) - len(visible)
+    # «у другого участника» - если все скрытые записи одного человека, иначе «у других участников»
+    someone = "другого участника" if len({o.get("owner_id") for o in others if o not in visible}) <= 1 \
+        else "других участников"
+    if n == 1:
+        return head + (f" в записи {_dup_ref(visible[0], r)}" if visible else " в записи у другого участника") \
+            + DUP_NUMBER_TAIL
+    parts = [_dup_ref(o, r) for o in visible[:3]]
+    if len(visible) > 3:
+        parts.append(f"и ещё {len(visible) - 3} {ru_plural(len(visible) - 3, ('запись', 'записи', 'записей'))}")
+    if hidden:
+        if not visible:
+            return head + where + " у " + someone + DUP_NUMBER_TAIL
+        parts.append(f"{hidden} {ru_plural(hidden, ('запись', 'записи', 'записей'))} у {someone}")
+    return head + where + ": " + "; ".join(parts) + DUP_NUMBER_TAIL
+
+
+def ru_plural(n: int, forms: tuple[str, str, str]) -> str:
+    import ru_text
+
+    return ru_text.plural(n, forms)
+
+
+def is_dup_number_issue(text_: str) -> bool:
+    t = (text_ or "").lower()
+    return (t.startswith("номер «") and "уже указан" in t) or t.startswith("этот номер достижения уже")
+
+
+def issues_for(r: dict, viewer: Optional[dict]) -> list[str]:
+    """r["issues"] с подробным текстом о повторе номера для конкретного зрителя (см. dup_number_text)."""
+    return [dup_number_text(r, viewer) if is_dup_number_issue(t) else t for t in (r.get("issues") or [])]
+
+
+ADMIN_VIEW = {"id": None, "role": "admin"}
 
 
 def _publication_keys(title: str, details: dict, date_from: Any) -> list[str]:
@@ -1509,8 +1620,7 @@ def _gaps(r: dict) -> list[tuple[bool, str]]:
     if r["form"] == "stipend" and not re.match(r"^\d{4}-\d{4}$", str(d.get("ayear") or "")):
         out.append((True, "укажите учебный год"))
     if r.get("dup_number"):
-        out.append((False, f"этот номер достижения уже указан в другой записи ({r['dup_number']}) - "
-                    "проверьте, не внесено ли одно достижение дважды"))
+        out.append((False, dup_number_text(r)))  # без подробностей; для показа - issues_for(r, viewer)
     if _in_report_otherwise(r):
         if kind_needs_number(r.get("kind_code"), r.get("owner_id")) and not has_number(r):
             out.append((True, NUMBER_MISSING_MSG if not (r.get("number") or "").strip() else
@@ -2028,12 +2138,13 @@ def report_data(year: int, db_path: DbTarget = None) -> dict:
                            "rows": rows, "records": own, "items": _items(own, sno_name)})
     warnings = [{"id": r["id"], "owner": r["owner_name"] or "СНО", "kind": r["kind_label"],
                  "title": r["title"], "date": fmt_date(r["date_from"]),
-                 "issues": ", ".join(r["issues"]), "counted": r["counted"]}
+                 "issues": ", ".join(issues_for(r, ADMIN_VIEW)), "counted": r["counted"]}
                 for r in recs if r["issues"] and not r["details"].get("no_index")]
     # записи без даты не попадают ни в один год (фильтр по периоду) - предупреждаем в каждом отчёте
     warnings += [{"id": r["id"], "owner": r["owner_name"] or "СНО", "kind": r["kind_label"],
                   "title": r["title"], "date": "",
-                  "issues": ", ".join(["нет даты - запись не попадёт ни в один годовой отчёт", *r["issues"]]),
+                  "issues": ", ".join(["нет даты - запись не попадёт ни в один годовой отчёт",
+                                       *issues_for(r, ADMIN_VIEW)]),
                   "counted": False}
                  for r in list_achievements(db_path=db_path) if not r["date_from"]]
     zaochno = sum(1 for r in recs if r["form"] == "doklad" and not r["ochno"])

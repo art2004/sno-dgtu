@@ -12,6 +12,7 @@ from sqlalchemy import text
 import achievements as ach
 import audit
 import db
+import smoke_privacy
 
 ROOT = Path(__file__).resolve().parent
 _N = iter(range(100, 99999))
@@ -322,6 +323,7 @@ def run_ui(target) -> None:  # noqa: ANN001
     os.environ.pop("ADMIN_PASSWORD", None)
     cwd = os.getcwd()
     os.chdir(str(ROOT))
+    smoke_privacy.consent_all(target)  # экран согласия на ПДн проверяется в smoke_privacy
 
     def session(user: dict) -> AppTest:
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
@@ -503,6 +505,7 @@ def run_inactive(target) -> None:  # noqa: ANN001
     cwd = os.getcwd()
     os.chdir(str(ROOT))
     try:
+        smoke_privacy.consent_all(target)
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120).run()
         at.text_input[0].input("ia")
         at.text_input[1].input("pass12345")

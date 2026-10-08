@@ -3,7 +3,8 @@ meetings CRUD, report settings, .docx/.xlsx report generation, year-filtered sta
 signed «remember me» cookie tokens (expiry, tamper, password change, deletion),
 members import from Excel, orphan events cleanup, admin edit of shared events,
 portfolio numbers in stats, role changes with last-admin safeguards; annual report
-(catalog, achievements, counting, migration, .docx/.xlsx) — see smoke_annual.py.
+(catalog, achievements, counting, migration, .docx/.xlsx) — see smoke_annual.py;
+согласие на обработку ПДн и текст о повторе номера — smoke_privacy.py.
 
 По умолчанию проверяет временную SQLite-базу (рабочая data/sno.db не трогается).
 
@@ -775,6 +776,9 @@ def main() -> None:
 
         _reset_pg(pg_url)
         smoke_events.run_all(_fresh_pg)
+        import smoke_privacy
+
+        smoke_privacy.run_all(_fresh_pg)
         _reset_pg(pg_url)
         print("OK (Postgres)")
         return
@@ -793,6 +797,9 @@ def main() -> None:
     import smoke_events
 
     smoke_events.run_all(lambda: tmp.with_name(f"sno_ev_{next(counter)}.db"))
+    import smoke_privacy
+
+    smoke_privacy.run_all(lambda: tmp.with_name(f"sno_pd_{next(counter)}.db"))
     print("OK")
     print(f"  smoke db: {tmp}")
 

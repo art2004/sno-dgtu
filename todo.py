@@ -95,10 +95,10 @@ def classify_issue(text_: str, form: str) -> str:
         return "no_topic"
     if t.startswith("укажите учебный год"):
         return "no_ayear"
+    if ach.is_dup_number_issue(t):  # «номер «…» уже указан …» - раньше проверки «номер достижения»
+        return "dup_number"
     if t.startswith("укажите номер достижения") or t.startswith("номер достижения"):
         return "no_number"
-    if t.startswith("этот номер достижения уже"):
-        return "dup_number"
     if t.startswith("уровень / подпункт не относится"):
         return "no_level"
     if t.startswith("укажите участника"):
@@ -110,13 +110,14 @@ def classify_issue(text_: str, form: str) -> str:
     return "other"
 
 
-def problems(r: dict) -> list[tuple[str, str]]:
-    """[(код, текст)] для записи; пусто - запись полная и идёт в отчёт."""
+def problems(r: dict, viewer: Optional[dict] = None) -> list[tuple[str, str]]:
+    """[(код, текст)] для записи; пусто - запись полная и идёт в отчёт. viewer ({id, role}) - кто смотрит:
+    для него текст о повторе номера называет другие записи, которые он вправе видеть (ach.issues_for)."""
     out: list[tuple[str, str]] = []
     d = r["details"]
     if d.get("no_index"):  # «Без индексации»: валидная запись вне отчёта, не предупреждение
         return out
-    for msg in r["issues"]:
+    for msg in (ach.issues_for(r, viewer) if viewer is not None else r["issues"]):
         out.append((classify_issue(msg, r["form"]), msg))
     if r["indicator_id"] is None and not any(c == "no_level" for c, _ in out):
         # is_counted(): без показателя запись не считается (грант без подпункта уже объяснён выше)
@@ -134,16 +135,18 @@ def problems(r: dict) -> list[tuple[str, str]]:
 
 
 def list_todo(year: Optional[int] = None, owner_id: Optional[int] = None,
-              types: Optional[list[str]] = None, db_path: Any = None) -> list[dict]:
+              types: Optional[list[str]] = None, db_path: Any = None,
+              viewer: Optional[dict] = None) -> list[dict]:
     """Записи с проблемами: запись + 'problems' [(код, текст)], 'problem_codes', 'problem_text'.
-    types - оставить записи, у которых есть хотя бы одна проблема из списка (None = DEFAULT_TYPES)."""
+    types - оставить записи, у которых есть хотя бы одна проблема из списка (None = DEFAULT_TYPES).
+    viewer - см. problems() (вкладка админа передаёт админа: в тексте видны все записи с тем же номером)."""
     want = set(types if types is not None else DEFAULT_TYPES)
     out = []
     recs = ach.list_achievements(owner_id=owner_id, year=year or None, db_path=db_path)
     if year:  # записи без даты не попадают ни в один год - показываем в любом периоде
         recs += [r for r in ach.list_achievements(owner_id=owner_id, db_path=db_path) if not r["date_from"]]
     for r in recs:
-        ps = [p for p in problems(r) if p[0] in want]
+        ps = [p for p in problems(r, viewer) if p[0] in want]
         if not ps:
             continue
         r = dict(r)
@@ -159,13 +162,14 @@ def in_report(r: dict) -> bool:
     return bool(r["counted"] and r["date_from"])
 
 
-def member_todo(recs: list[dict]) -> dict:
+def member_todo(recs: list[dict], viewer: Optional[dict] = None) -> dict:
     """Баннер «Требуют заполнения» в «Мои достижения»: свои записи участника (соавторские - нет, их
     правит внесший) по тем же правилам, что «Что дозаполнить» (problems() без заочных докладов).
       'items'   - {id: {'problems': [(код, текст)], 'in_report': bool}} для каждой записи с проблемами;
       'out'     - id записей, которые НЕ попадут в отчёт, пока их не дозаполнят;
       'check'   - id записей в отчёте, но с замечаниями «проверьте» (WARNING_ONLY);
-      'by_type' - {код: сколько записей из 'out' с этой проблемой}, по убыванию."""
+      'by_type' - {код: сколько записей из 'out' с этой проблемой}, по убыванию.
+    viewer - участник, который смотрит (тексты о повторе номера - только с видимыми ему записями)."""
     items: dict[int, dict] = {}
     out: list[int] = []
     check: list[int] = []
@@ -173,7 +177,7 @@ def member_todo(recs: list[dict]) -> dict:
     for r in recs:
         if r.get("role", "owner") != "owner":
             continue
-        ps = [p for p in problems(r) if p[0] != "zaochno"]
+        ps = [p for p in problems(r, viewer) if p[0] != "zaochno"]
         if not ps:
             continue
         ok = in_report(r)

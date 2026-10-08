@@ -16,6 +16,7 @@ import achievements as ach
 import audit
 import backup
 import db
+import smoke_privacy
 import todo
 
 ROOT = Path(__file__).resolve().parent
@@ -315,7 +316,9 @@ def run_report_gate(target) -> None:  # noqa: ANN001
     a2 = ach.save_achievement({**ids["prize"][1], "title": "Премия 2", "number": "Р-Н-905-26"}, admin,
                               db_path=target)["id"]
     r2 = ach.get_achievement(a2, target)
-    assert r2["counted"] and any("уже указан в другой записи" in i for i in r2["issues"])
+    # без «(N)»: «номер «…» уже указан ещё в 2 записях» (номер Р-Н-905-26 стоит ещё у двух записей выше)
+    assert r2["counted"] and any(i.startswith("номер «Р-Н-905-26» уже указан ещё в 2 записях") for i in r2["issues"]), \
+        r2["issues"]
     assert any("уже указан" in i for i in ach.get_achievement(gid, target)["issues"])
     ach.delete_achievement(a2, db_path=target)
 
@@ -629,6 +632,7 @@ def run_ui(target) -> None:  # noqa: ANN001
     cwd = os.getcwd()
     os.chdir(app_dir)
     try:
+        smoke_privacy.consent_all(target)  # экран согласия на ПДн проверяется в smoke_privacy
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
         at.session_state["user"] = {"id": admin["id"], "login": admin["login"], "full_name": admin["full_name"],
                                     "role": "admin"}
@@ -791,6 +795,7 @@ def run_member_banner(target) -> None:  # noqa: ANN001
     cwd = os.getcwd()
     os.chdir(str(ROOT))
     try:
+        smoke_privacy.consent_all(target)
         at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
         at.session_state["user"] = {"id": m, "login": "bn_m", "full_name": "Баннеров Борис", "role": "member"}
         at.run()
