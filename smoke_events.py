@@ -64,7 +64,7 @@ def _build(target) -> dict:  # noqa: ANN001
     K = ach.kind_by_code("contest", target)
     other["contest"] = ach.save_achievement(
         {"kind_id": K["id"], "owner_id": u["u3"], "row_id": ach.row_by_code("I03.ru", target)["id"],
-         "title": CONF, "date_from": "2026-03-10", "number": "Р-Н-9-26"}, _admin(target), db_path=target)["id"]
+         "title": CONF, "date_from": "2026-03-10", "number": "Р-Н-9-26", "result": "Участие"}, _admin(target), db_path=target)["id"]
     return {"u": u, "a": a, "b": b, "c": c, **other}
 
 
@@ -260,7 +260,8 @@ def run_merge_custom(target) -> None:  # noqa: ANN001
 
     def contest(owner, title, d1, d2, members, number):  # noqa: ANN001, ANN202
         return ach.save_achievement({"kind_id": KC["id"], "owner_id": owner, "row_id": rc, "title": title,
-                                     "date_from": d1, "date_to": d2, "members": members, "number": number},
+                                     "date_from": d1, "date_to": d2, "members": members, "number": number,
+                                     "result": "Участие"},
                                     admin, db_path=target)["id"]
     c1 = contest(u1, "Кейс-чемпионат Дон", "2026-05-10", "2026-05-12", [u2], "Р-Н-21-26")
     c2 = contest(u2, "Кейс чемпионат «Дон»", "2026-05-12", "2026-05-14", [u1], "Р-Н-22-26")

@@ -88,6 +88,11 @@ def _prefill(pfx: str, rec: dict) -> None:
             ss[f(key)] = d.get("ayear") or ""
         elif ftype == "select":
             ss[f(key)] = d.get(key) or _extra["options"][0]
+        elif ftype == "result":
+            v = str(d.get(key) or "").strip()
+            hit = next((o for o in ach.RESULT_OPTIONS if o.lower() == v.lower()), None)
+            ss[f(key)] = hit or (ach.RESULT_OTHER if v else None)
+            ss[f(key + "_other")] = "" if hit else v
         elif ftype == "people":
             ss[f("members")] = [p["user_id"] for p in rec["people"] if p["user_id"]]
             ext = [p["name"] for p in rec["people"] if not p["user_id"] and p["name"]]
@@ -131,6 +136,9 @@ def _collect(pfx: str, kind: dict, form: str) -> dict:
             data["coauthors"] = co
         elif ftype == "meeting":
             data["meeting_id"] = f("meeting") or None
+        elif ftype == "result":
+            v = f(key) or ""
+            data[key] = (f(key + "_other") or "").strip() if v == ach.RESULT_OTHER else v
         else:
             data[key] = f(key)
     return data
@@ -269,6 +277,17 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
             if ss.get(f(key)) not in extra["options"]:
                 ss[f(key)] = extra["options"][0]
             st.selectbox(lab, extra["options"], key=f(key))
+        elif ftype == "result":
+            opts = [*ach.RESULT_OPTIONS, ach.RESULT_OTHER]
+            if ss.get(f(key)) not in opts:
+                ss[f(key)] = None
+            st.selectbox(lab, opts, key=f(key), help=hlp, index=None, placeholder="— выберите результат —")
+            if ss.get(f(key)) == ach.RESULT_OTHER:
+                ss.setdefault(f(key + "_other"), "")
+                st.text_input("Свой вариант результата *", key=f(key + "_other"),
+                              placeholder="например: 1 место, специальный приз")
+            elif record is not None and not str(record["details"].get(key) or "").strip():
+                st.warning("⚠ не указан результат - выберите (если просто участвовали - «Участие»)")
         elif ftype == "check":
             ss.setdefault(f(key), extra.get("default", False))
             st.checkbox(label, key=f(key), help=hlp)

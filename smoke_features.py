@@ -267,6 +267,8 @@ def run_report_gate(target) -> None:  # noqa: ANN001
     nxt = iter(range(1, 999))
     for label, code, f, need in cases:
         data = {"kind_id": K[code]["id"], "owner_id": u, **f}
+        if K[code]["form"] in ("contest", "prize"):
+            data.setdefault("result", "Участие")
         res = ach.save_achievement(data, admin, db_path=target)  # без номера сохраняется
         rec = ach.get_achievement(res["id"], target)
         if need:
@@ -822,11 +824,39 @@ def run_member_banner(target) -> None:  # noqa: ANN001
           f"сводка {len(bt)} причин; «⚠ проверьте» отдельно; фильтр «только требующие заполнения»)")
 
 
+def run_result_required(target) -> None:  # noqa: ANN001
+    """Конкурс / премия: результат обязателен (в т.ч. «Участие»); старые записи без результата -
+    только предупреждение «не указан результат», в отчёт идут как раньше."""
+    db.init_db(db_path=target, seed_admin=True)
+    admin = _admin(target)
+    u = db.create_user("res_u", "pass12345", "Результатов Рома", db_path=target)
+    for code in ("contest", "prize"):
+        k = ach.kind_by_code(code, target)
+        rid = ach.row_by_code("I03.ru" if code == "contest" else "I14.ru", target)["id"]
+        base = {"kind_id": k["id"], "row_id": rid, "title": "Тест", "date_from": "2026-03-01", "owner_id": u}
+        for bad in (None, "", "  ", ach.RESULT_OTHER):
+            try:
+                ach.save_achievement({**base, "result": bad}, admin, db_path=target)
+                raise AssertionError(f"{code}: сохранилось без результата ({bad!r})")
+            except ValueError as e:
+                assert "результат" in str(e).lower(), e
+        i = ach.save_achievement({**base, "result": "Участие"}, admin, db_path=target)["id"]
+        assert ach.get_achievement(i, target)["details"]["result"] == "Участие"
+        i = ach.save_achievement({**base, "result": "1 место"}, admin, db_path=target)["id"]
+        rec = ach.get_achievement(i, target)
+        assert ach.RESULT_MISSING_MSG not in ach.record_issues(rec)
+        rec2 = {**rec, "details": {**rec["details"], "result": ""}}  # старая запись без результата
+        assert ach.RESULT_MISSING_MSG in ach.record_issues(rec2)
+        assert not any(b for b, m in ach._gaps(rec2) if m == ach.RESULT_MISSING_MSG)
+    print("  результат конкурса/премии OK (обязателен, «Участие»/«Другое…», старые - предупреждение без блокировки)")
+
+
 def run_all(fresh) -> None:  # noqa: ANN001
     """fresh(): новая пустая база (SQLite-файл или очищенная Postgres)."""
     run_audit(fresh())
     run_todo(fresh())
     run_member_banner(fresh())
     run_report_gate(fresh())
+    run_result_required(fresh())
     run_backup(fresh(), fresh())
     run_ui(fresh())

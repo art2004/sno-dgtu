@@ -154,6 +154,11 @@ _TAIL = [("number", "Номер достижения (Р-Н-…, с сайта �
 CONTEST_RESULTS = ("участие", "диплом", "призёр", "лауреат")
 NO_INDEX = -2  # публикация «Без индексации»: валидная запись, в годовой отчёт не входит
 NO_INDEX_LABEL = "без индексации (в годовой отчёт не входит)"
+# Результат конкурса / премии: обязателен (в т.ч. «Участие»). «Другое…» -> свой текст.
+RESULT_OPTIONS = ("Победитель", "Призёр", "Диплом I степени", "Диплом II степени", "Диплом III степени",
+                  "Лауреат", "Участие")
+RESULT_OTHER = "Другое…"
+RESULT_MISSING_MSG = "не указан результат"
 GRANT_STATUSES = ("подана", "поддержана", "не поддержана")
 FUND_SOURCES = ("бюджет", "внебюджет")
 
@@ -191,8 +196,9 @@ FORMS: dict[str, list[tuple]] = {
         ("title", "Конкурс / кейс-чемпионат", "text", True, {}),
         ("date_from", "Дата начала", "date", True, {}),
         ("date_to", "Дата окончания (если несколько дней)", "date_opt", False, {}),
-        ("result", "Результат (необязательно)", "text", False,
-         {"help": "Например: диплом II степени, 1 место, лауреат. Печатается в конце строки отчёта."}),
+        ("result", "Результат", "result", True,
+         {"help": "Обязательно, даже если просто участие. Свой вариант (например, 1 место) - «Другое…». "
+                  "Печатается в конце строки отчёта (кроме «Участие»)."}),
         ("people", "Участники", "people", False, {}),
         *_TAIL,
     ],
@@ -206,6 +212,8 @@ FORMS: dict[str, list[tuple]] = {
     "prize": [
         ("title", "Название премии", "text", True, {}),
         ("date_from", "Дата", "date", True, {}),
+        ("result", "Результат", "result", True,
+         {"help": "Обязательно, даже если просто участие. Свой вариант - «Другое…»."}),
         ("people", "Участники", "people", False, {}),
         *_TAIL,
     ],
@@ -1016,6 +1024,10 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
             v = 1 if v else 0
         elif isinstance(v, str):
             v = v.strip()
+        if ftype == "result" and v == RESULT_OTHER:
+            v = ""
+        if ftype == "result" and v in (None, ""):
+            raise ValueError("Укажите результат (если просто участвовали - выберите «Участие»)")
         if required and v in (None, ""):
             raise ValueError(f"Заполните поле «{short}»")
         if ftype == "select" and v and v not in extra["options"]:
@@ -1566,7 +1578,7 @@ def missing_required(r: dict) -> list[str]:
     out = []
     d = r.get("details") or {}
     for key, label, ftype, required, extra in FORMS.get(r.get("form"), []):
-        if not required or ftype in ("people", "authors", "meeting", "check") \
+        if not required or ftype in ("people", "authors", "meeting", "check", "result") \
                 or key in _OWN_MESSAGE_FIELDS.get(r.get("form"), ()):
             continue
         if ftype == "pubdate":
@@ -1619,6 +1631,9 @@ def _gaps(r: dict) -> list[tuple[bool, str]]:
         out.append((True, "заполните тему доклада"))  # строка отчёта «доклад на тему: «»» без темы пуста
     if r["form"] == "stipend" and not re.match(r"^\d{4}-\d{4}$", str(d.get("ayear") or "")):
         out.append((True, "укажите учебный год"))
+    if any(ft == "result" for _k, _l, ft, _r, _e in FORMS.get(r["form"], [])) \
+            and not str(d.get("result") or "").strip():
+        out.append((False, RESULT_MISSING_MSG))  # старые записи: только предупреждение, отчёт не блокирует
     if r.get("dup_number"):
         out.append((False, dup_number_text(r)))  # без подробностей; для показа - issues_for(r, viewer)
     if _in_report_otherwise(r):
