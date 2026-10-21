@@ -504,6 +504,8 @@ def stipend_title_for_row(row: Optional[dict]) -> Optional[str]:
     if not row or str(row.get("code", "")).endswith(".other"):
         return None
     t = strip_dash(row["label"])
+    if t.lower().startswith("стипендии "):  # справочник во мн. числе -> «Стипендия …»
+        t = "стипендия " + t[len("стипендии "):]
     return t[:1].upper() + t[1:] if t else None
 
 
