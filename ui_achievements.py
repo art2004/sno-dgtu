@@ -252,6 +252,16 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
                      if i == NONE else names.get(i, "?"))
     owner_id = ss.get(f("owner")) if is_admin else acting["id"]
 
+    stip_fixed = None  # стипендия с конкретным подпунктом: поле названия не показываем
+    if kind["code"] == "stipend" and rows:
+        stip_fixed = ach.stipend_title_for_row(next((r for r in rows if r["id"] == ss.get(f("row"))), None))
+        if stip_fixed:
+            ss[f("title")] = stip_fixed
+            old_t = (record["title"] or "").strip() if record is not None else ""
+            if old_t and old_t != stip_fixed:
+                st.caption(f"Было сохранено название «{old_t}» - при сохранении станет «{stip_fixed}». "
+                           "Если это другая стипендия, выберите «иные именные стипендии».")
+
     for key, label, ftype, required, extra in ach.FORMS[form]:
         lab = label + (" *" if required and ftype not in ("check",) else "")
         hlp = extra.get("help")
@@ -260,6 +270,13 @@ def achievement_form(pfx: str, acting: dict, record: Optional[dict] = None, on_b
             hlp = "Без номера запись сохраняется, но в годовой отчёт не попадает."
         elif key == "number" and kind["code"] == "stipend":
             hlp = "Для стипендии номер необязателен: запись попадает в отчёт и без него."
+        if key == "title" and kind["code"] == "stipend":
+            if stip_fixed or not rows or ss.get(f("row")) in (NONE, None):
+                continue  # название = выбранный вариант; при «иные» - вводится ниже
+            if ss.get(f("title")) and ach.stipend_title_for_row(
+                    next((r for r in rows if ach.stipend_title_for_row(r) == ss.get(f("title"))), None)):
+                ss[f("title")] = ""  # переключились с конкретной на «иные» - не оставляем чужое название
+            lab = "Название стипендии *"
         if ftype == "text":
             ss.setdefault(f(key), "")
             st.text_input(lab, key=f(key), help=hlp,

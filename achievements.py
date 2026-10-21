@@ -498,6 +498,15 @@ def strip_dash(label: str) -> str:
     return re.sub(r"^\s*-\s*", "", label or "").strip()
 
 
+def stipend_title_for_row(row: Optional[dict]) -> Optional[str]:
+    """Стипендия: название из выбранного подпункта (Президента, Правительства, …).
+    None - подпункт «иные именные стипендии» (или не выбран): название вводит участник."""
+    if not row or str(row.get("code", "")).endswith(".other"):
+        return None
+    t = strip_dash(row["label"])
+    return t[:1].upper() + t[1:] if t else None
+
+
 def _share_str(v: Optional[float]) -> str:
     if v is None:
         return "?"
@@ -994,6 +1003,11 @@ def save_achievement(data: dict, acting_user: dict, achievement_id: Optional[int
         details["no_index"] = True
     else:
         details.pop("no_index", None)
+    if kind["code"] == "stipend" and row_id:
+        fixed = stipend_title_for_row(next((x for x in indicator_rows(ind_id, db_path, include_hidden=True)
+                                            if x["id"] == row_id), None))
+        if fixed:  # конкретная стипендия: название = выбранный вариант (без дубля в форме)
+            data = {**data, "title": fixed}
     for key, label, ftype, required, extra in FORMS[form]:
         v = data.get(key)
         short = label.split(" (")[0]
