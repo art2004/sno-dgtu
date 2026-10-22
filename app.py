@@ -346,6 +346,9 @@ def render_sidebar(user: dict) -> None:
         st.markdown(f"**{user['full_name']}**")
         role_label = "Лидер СНО (админ)" if user["role"] == "admin" else "Член совета"
         st.caption(f"{role_label} · @{user['login']}")
+        _me = next((x for x in db.list_users() if x["id"] == user["id"]), None)
+        if db.study_label(_me):
+            st.caption(db.study_label(_me))
         if impersonating:
             st.caption("Режим «войти как участник»")
             if st.button("Вернуться в админа", key="imp_return_sb", width="stretch"):
@@ -423,6 +426,11 @@ def _audit_user_update(u: dict, acting: dict, fields: dict) -> None:
              "Логин": (fields.get("login") or u["login"]).strip(),
              "Активен": ("да" if fields["active"] else "нет") if fields.get("active") is not None else before["Активен"],
              "Роль": _role_label(fields["role"]).lower() if fields.get("role") else before["Роль"]}
+    for key, label in (("study_group", "Группа"), ("faculty", "Факультет"), ("course", "Курс"),
+                       ("speciality", "Направление")):
+        old = "" if u.get(key) is None else str(u.get(key))
+        before[label] = old
+        after[label] = old if fields.get(key) is None else str(fields[key]).strip()
     changes = audit.diff_fields(before, after)
     if fields.get("password"):
         changes.append({"field": "Пароль", "before": "", "after": "изменён"})
@@ -499,7 +507,9 @@ def admin_members(user: dict) -> None:
     for u in users:
         active_mark = "✅" if u["active"] else "⛔"
         role_ru = "админ" if u["role"] == "admin" else "член совета"
-        with st.expander(f"{active_mark} {u['full_name']} (@{u['login']}, {role_ru})"):
+        study = db.study_label(u)
+        with st.expander(f"{active_mark} {u['full_name']} (@{u['login']}, {role_ru})"
+                         + (f" — {study}" if study else "")):
             with st.form(f"edit_user_{u['id']}"):
                 new_name = st.text_input("ФИО", value=u["full_name"])
                 new_login = st.text_input("Логин", value=u["login"])
@@ -514,6 +524,12 @@ def admin_members(user: dict) -> None:
                     disabled=u["id"] == user["id"],
                     help="Свою роль изменить нельзя." if u["id"] == user["id"] else None,
                 )
+                g1, g2, g3 = st.columns([2, 3, 1])
+                new_group = g1.text_input("Группа", value=u.get("study_group") or "", key=f"grp_{u['id']}")
+                new_faculty = g2.text_input("Факультет", value=u.get("faculty") or "", key=f"fac_{u['id']}")
+                new_course = g3.text_input("Курс", value="" if u.get("course") is None else str(u["course"]),
+                                           key=f"crs_{u['id']}")
+                new_spec = st.text_input("Направление", value=u.get("speciality") or "", key=f"spec_{u['id']}")
                 new_active = st.checkbox("Активен", value=bool(u["active"]))
                 col_save, col_del = st.columns(2)
                 save = col_save.form_submit_button("Сохранить")
@@ -529,6 +545,8 @@ def admin_members(user: dict) -> None:
                             password=new_password if new_password else None,
                             active=new_active,
                             role=None if u["id"] == user["id"] else new_role,
+                            study_group=new_group, faculty=new_faculty, course=new_course,
+                            speciality=new_spec,
                         )
                         if new_role == "admin" and u["role"] != "admin" and u["id"] != user["id"]:
                             st.session_state[f"confirm_role_{u['id']}"] = fields  # ask first
@@ -705,9 +723,12 @@ def admin_stats() -> None:
     by_person = ach.stats_by_person(y)
     st.markdown("#### Топ-5 активных")
     top = by_person[:5]
+    _top_study = {x["id"]: x.get("study_group") or "" for x in db.list_users()}
     if top:
         st.markdown("\n".join(
-            f"{i}. {r['full_name']} — {ru_text.with_count(r['total'], ua.RECORD_FORMS)}"
+            f"{i}. {r['full_name']}"
+            + (f" ({_top_study[r.get('user_id')]})" if _top_study.get(r.get("user_id")) else "")
+            + f" — {ru_text.with_count(r['total'], ua.RECORD_FORMS)}"
             for i, r in enumerate(top, start=1)))
     else:
         st.caption("За выбранный период записей пока нет.")
@@ -742,11 +763,16 @@ def admin_stats() -> None:
         st.dataframe(df_ind, hide_index=True, width="stretch")
 
         st.markdown("#### По участникам")
+        _ustudy = {x["id"]: x for x in db.list_users()}
         if by_person:
             kinds = [k["label"] for k in ach.list_kinds(admin=True, include_hidden=True)]
             used = [k for k in kinds if any(k in r["by_kind"] for r in by_person)]
             st.dataframe(
-                pd.DataFrame([{"ФИО": r["full_name"], "Логин": r["login"], "Всего": r["total"],
+                pd.DataFrame([{"ФИО": r["full_name"], "Логин": r["login"],
+                               "Группа": (_ustudy.get(r.get("user_id")) or {}).get("study_group") or "",
+                               "Факультет": (_ustudy.get(r.get("user_id")) or {}).get("faculty") or "",
+                               "Курс": (_ustudy.get(r.get("user_id")) or {}).get("course") or "",
+                               "Всего": r["total"],
                                "В отчёте": r["counted"], **{k: r["by_kind"].get(k, 0) for k in used},
                                "С номером / всего": f"{r['with_number']} / {r['total']}"} for r in by_person]),
                 width="stretch", hide_index=True)

@@ -410,6 +410,11 @@ _ADDED_COLUMNS = [
     # согласие на обработку ПДн (152-ФЗ): время (МСК) и версия политики; NULL = ещё не давал
     ("users", "pd_consent_at", "TEXT"),
     ("users", "pd_consent_version", "TEXT"),
+    # учебная группа / факультет / курс / направление (NULL = не указано)
+    ("users", "study_group", "TEXT"),
+    ("users", "faculty", "TEXT"),
+    ("users", "course", "INTEGER"),
+    ("users", "speciality", "TEXT"),
     ("events", "article_topic", "TEXT"),
     ("events", "indexing", "TEXT"),
     ("participations", "achievement_number", "TEXT"),
@@ -628,7 +633,8 @@ def list_users(
     role: Optional[str] = None,
     db_path: DbTarget = None,
 ) -> list[dict]:
-    sql = ("SELECT id, login, full_name, role, created_at, active, last_login, pd_consent_at, pd_consent_version "
+    sql = ("SELECT id, login, full_name, role, created_at, active, last_login, pd_consent_at, pd_consent_version, "
+           "study_group, faculty, course, speciality "
            "FROM users WHERE 1=1")
     params: dict[str, Any] = {}
     if active_only:
@@ -639,6 +645,16 @@ def list_users(
     sql += " ORDER BY role DESC, LOWER(full_name)"
     with get_engine(db_path).connect() as conn:
         return _rows(conn.execute(text(sql), params))
+
+
+def study_label(u: Optional[dict]) -> str:
+    """«ВКБ41 · ИиВТ · 4 курс» из полей пользователя; пустые (NULL) пропускаются."""
+    if not u:
+        return ""
+    parts = [str(u.get("study_group") or "").strip(), str(u.get("faculty") or "").strip()]
+    if u.get("course") not in (None, ""):
+        parts.append(f"{u['course']} курс")
+    return " · ".join(x for x in parts if x)
 
 
 def _now_msk() -> str:
@@ -756,8 +772,13 @@ def update_user(
     role: Optional[str] = None,
     acting_user_id: Optional[int] = None,
     db_path: DbTarget = None,
+    study_group: Optional[str] = None,
+    faculty: Optional[str] = None,
+    course: Optional[Any] = None,
+    speciality: Optional[str] = None,
 ) -> None:
-    """Raises DuplicateError if the new login is taken, AdminGuardError if the change
+    """study_group/faculty/course/speciality: None = не менять, "" = очистить (NULL).
+    Raises DuplicateError if the new login is taken, AdminGuardError if the change
     would demote yourself or leave no active admin."""
     from auth import hash_password
 
@@ -780,6 +801,16 @@ def update_user(
     if role is not None:
         fields.append("role = :role")
         params["role"] = role
+    for col, val in (("study_group", study_group), ("faculty", faculty), ("speciality", speciality)):
+        if val is not None:
+            fields.append(f"{col} = :{col}")
+            params[col] = val.strip() or None
+    if course is not None:
+        c = str(course).strip()
+        if c and not (c.isdigit() and 1 <= int(c) <= 6):
+            raise ValueError("Курс должен быть числом от 1 до 6.")
+        fields.append("course = :course")
+        params["course"] = int(c) if c else None
     if not fields:
         return
     with get_engine(db_path).begin() as conn:
